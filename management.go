@@ -699,9 +699,24 @@ func modelsPayload() map[string]any {
 			"supports_refs":   model.supportsReferenceImages(),
 		})
 	}
+	if cfg.AgentEnabled {
+		for _, model := range knownAgentModels(cfg) {
+			models = append(models, map[string]any{
+				"id":          cfg.advertisedModelID(model.ID),
+				"upstream":    model.ID,
+				"media":       "chat",
+				"label":       model.Name,
+				"description": model.Description,
+				"badge":       "agent",
+				"credits":     model.Credits,
+				"available":   true,
+			})
+		}
+	}
 	return map[string]any{
 		"ok":      true,
 		"tier":    snapshot.Tier,
+		"agent":   agentStatusView(cfg),
 		"fetched": formatTime(snapshot.FetchedAt),
 		"error":   snapshot.Err,
 		"models":  models,
@@ -903,6 +918,7 @@ func diagnosticsPayload() map[string]any {
 	}
 	report["checks"] = checks
 	report["upstream"] = listUpstreamTraces()
+	report["agent"] = agentStatusView(cfg)
 	if snapshot.Err != "" {
 		report["ok"] = false
 	}

@@ -55,6 +55,14 @@ func registrationConfigFields() []pluginapi.ConfigField {
 		field("enable_browser_import", pluginapi.ConfigFieldTypeBoolean, "是否允许面板读取本机 Edge/Chrome 登录态。"),
 		field("browser_profiles", pluginapi.ConfigFieldTypeArray, "限定扫描的浏览器 profile，如 edge:Default。"),
 		field("include_watermark", pluginapi.ConfigFieldTypeBoolean, "请求带水印的产物。"),
+		field("agent_enabled", pluginapi.ConfigFieldTypeBoolean, "暴露 Agent 对话模型（deepseek / glm / kimi / gpt 等）。"),
+		field("agent_default_model", pluginapi.ConfigFieldTypeString, "未指定或未知 Agent 模型时的默认值。"),
+		field("agent_models", pluginapi.ConfigFieldTypeArray, "额外注册的 Agent 模型 ID。"),
+		field("agent_project_id", pluginapi.ConfigFieldTypeString, "固定使用的 Miora 项目 ID（留空自动创建/复用）。"),
+		field("agent_project_title", pluginapi.ConfigFieldTypeString, "插件创建的 Miora 项目名称。"),
+		field("agent_mode", pluginapi.ConfigFieldTypeEnum, "ACP 会话模式，bypassPermissions 可免去工具审批。"),
+		field("agent_timeout_seconds", pluginapi.ConfigFieldTypeInteger, "单轮 Agent 对话超时。"),
+		field("agent_runtime_ttl_minutes", pluginapi.ConfigFieldTypeInteger, "Agent 沙箱复用时长。"),
 		field("response_footer", pluginapi.ConfigFieldTypeBoolean, "在回复末尾追加紧凑的生成信息。"),
 		field("catalog_ttl_minutes", pluginapi.ConfigFieldTypeInteger, "模型目录缓存时长。"),
 		field("auto_refresh_hours", pluginapi.ConfigFieldTypeInteger, "提前多少小时轮换即将过期的 token。"),
@@ -178,6 +186,56 @@ func modelInfos() []pluginapi.ModelInfo {
 			SupportedInputModalities:   modalities,
 			SupportedOutputModalities:  outputs,
 			SupportedParameters:        generationParameters(kind),
+		})
+	}
+	if cfg.AgentEnabled {
+		out = append(out, agentModelInfos(cfg, now)...)
+	}
+	return out
+}
+
+// agentModelInfos registers the Agent (ACP chat) catalogue as chat models. They
+// are a separate catalogue from media: the executor routes them over ACP.
+func agentModelInfos(cfg *Config, now int64) []pluginapi.ModelInfo {
+	models := knownAgentModels(cfg)
+	if len(models) == 0 {
+		ctx, cancel := contextWithTimeout(12 * time.Second)
+		defer cancel()
+		loadAgentTiers(ctx, cfg)
+		models = knownAgentModels(cfg)
+	}
+	out := make([]pluginapi.ModelInfo, 0, len(models))
+	for _, model := range models {
+		description := model.Description
+		if description == "" {
+			description = "Miora Agent 对话模型"
+		}
+		if model.Credits != "" {
+			description += "（" + model.Credits + "）"
+		}
+		contextLength := model.MaxInput
+		if contextLength <= 0 {
+			contextLength = 200000
+		}
+		maxOutput := model.MaxOutput
+		if maxOutput <= 0 {
+			maxOutput = 32000
+		}
+		out = append(out, pluginapi.ModelInfo{
+			ID:                         cfg.advertisedModelID(model.ID),
+			Object:                     "model",
+			Created:                    now,
+			OwnedBy:                    providerID,
+			Type:                       "chat",
+			DisplayName:                firstNonEmpty(model.Name, model.ID),
+			Name:                       model.ID,
+			Description:                description,
+			ContextLength:              contextLength,
+			MaxCompletionTokens:        maxOutput,
+			SupportedGenerationMethods: []string{"chat.completions"},
+			SupportedInputModalities:   []string{"text", "image"},
+			SupportedOutputModalities:  []string{"text"},
+			SupportedParameters:        []string{"stream", "max_tokens", "temperature"},
 		})
 	}
 	return out

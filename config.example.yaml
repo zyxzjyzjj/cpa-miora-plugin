@@ -56,7 +56,22 @@ plugins:
       auto_refresh_hours: 24
       event_log_size: 200
 
+      # --- Agent 对话（deepseek / glm / kimi / gpt …）-----------------------
+      agent_enabled: true
+      # 未指定或未知 Agent 模型时的默认值
+      agent_default_model: "deepseek-v4.1-flash"
+      # 额外注册的 Agent 模型 ID（运行时用 availableModels 自动补全）
+      agent_models: []
+      # 固定使用的 Miora 项目（留空则由插件创建/复用 “CPA 会话”）
+      agent_project_id: ""
+      agent_project_title: "CPA 会话"
+      # ACP 会话模式：bypassPermissions 免去工具审批（无状态代理无法点确认框）
+      agent_mode: "bypassPermissions"
+      agent_timeout_seconds: 300
+      agent_runtime_ttl_minutes: 120
+
       # 上游传输。direct:// 强制直连；use_host_http=false 完全绕开宿主桥。
       proxy_url: ""
       use_host_http: true
       request_timeout_seconds: 60
+

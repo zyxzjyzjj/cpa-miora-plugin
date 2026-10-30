@@ -37,6 +37,7 @@ func decodeExecutorRequest(request []byte) (*executorRequest, error) {
 type parsedChat struct {
 	Model       string
 	Prompt      string
+	Messages    []chatMessage
 	Images      []string
 	AspectRatio string
 	Resolution  string
@@ -72,6 +73,7 @@ func parseChatPayload(payload []byte) (*parsedChat, error) {
 	var messages []chatMessage
 	if raw, ok := root["messages"]; ok {
 		_ = json.Unmarshal(raw, &messages)
+		parsed.Messages = messages
 		parsed.Prompt = promptFromMessages(messages)
 		parsed.Images = append(parsed.Images, imagesFromMessages(messages)...)
 	}
@@ -324,6 +326,7 @@ type executionPlan struct {
 	generations []generateRequest
 	model       string
 	media       string
+	agent       bool
 	stream      bool
 	streamID    string
 }
@@ -349,6 +352,21 @@ func planExecution(ctx context.Context, cfg *Config, req *executorRequest) (*exe
 	model, media, errModel := resolveModel(cfg, parsed)
 	if errModel != nil {
 		return nil, errModel
+	}
+
+	// Agent models are a different transport (ACP over HTTP+SSE), not a media
+	// generation: route before any media planning happens.
+	if cfg.AgentEnabled && isAgentModelID(cfg, model) {
+		return &executionPlan{
+			cfg:      cfg,
+			cred:     cred,
+			parsed:   parsed,
+			model:    model,
+			media:    "chat",
+			agent:    true,
+			stream:   req.Stream,
+			streamID: req.StreamID,
+		}, nil
 	}
 
 	plan := &executionPlan{
@@ -709,11 +727,32 @@ func executorExecute(request []byte) ([]byte, error) {
 	if errPermit != nil {
 		return failEnvelope("busy", "生成并发已满，请稍后重试", http.StatusTooManyRequests)
 	}
-	defer release()
+	permitReleased := false
+	releasePermit := func() {
+		if !permitReleased {
+			permitReleased = true
+			release()
+		}
+	}
+	defer releasePermit()
 	plan, errPlan := planExecution(ctx, cfg, req)
 	if errPlan != nil {
 		logWarn("executor plan failed", map[string]any{"error": errPlan.Error()})
 		return executionFailure(errPlan)
+	}
+	if plan.agent {
+		// Media concurrency slots are irrelevant to an ACP turn, which is bounded by
+		// the agent sandbox instead.
+		releasePermit()
+		content, usage, errAgent := runAgentTurn(ctx, cfg, plan, nil)
+		if errAgent != nil {
+			return executionFailure(errAgent)
+		}
+		logInfo("agent turn served", map[string]any{"model": plan.model, "chars": len(content)})
+		return okEnvelope(pluginapi.ExecutorResponse{
+			Payload: agentCompletionBody(req.Model, content, usage),
+			Headers: http.Header{"Content-Type": []string{"application/json"}},
+		})
 	}
 
 	results := make([]*generationResult, 0, len(plan.generations))
@@ -751,7 +790,14 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 		}
 		return failEnvelope("busy", "生成并发已满，请稍后重试", http.StatusTooManyRequests)
 	}
-	defer release()
+	permitReleased := false
+	releasePermit := func() {
+		if !permitReleased {
+			permitReleased = true
+			release()
+		}
+	}
+	defer releasePermit()
 
 	plan, errPlan := planExecution(ctx, cfg, req)
 	if errPlan != nil {
@@ -762,6 +808,10 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 			return okEnvelope(map[string]any{"headers": streamHeaders()})
 		}
 		return executionFailure(errPlan)
+	}
+	if plan.agent {
+		releasePermit()
+		return executorAgentStream(ctx, cfg, req, plan)
 	}
 
 	stream := completionStream{id: completionID(), model: req.Model, created: time.Now().Unix()}

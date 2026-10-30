@@ -939,6 +939,7 @@ const panelTemplate = `<!doctype html>
   function mediaLabel(media) {
     if (media === "video") { return "视频"; }
     if (media === "three_d") { return "3D"; }
+    if (media === "chat") { return "对话"; }
     return "图像";
   }
 
@@ -957,7 +958,11 @@ const panelTemplate = `<!doctype html>
       var ratios = (model.aspect_ratios || []).slice(0, 5).join(" ") || "—";
       var resolutions = (model.resolutions || []).join(" ") || "—";
       var refs = model.supports_refs ? ("≤ " + (model.max_references || 1)) : "不支持";
-      var status = model.available ? '<span class="pill ok">可用</span>' : '<span class="pill warn">受限</span>';
+      var status = model.available
+        ? (model.media === "chat"
+            ? '<span class="pill brand">Agent ' + esc(model.credits || "") + "</span>"
+            : '<span class="pill ok">可用</span>')
+        : '<span class="pill warn">受限</span>';
       return "<tr><td><div style=\"font-weight:600\">" + esc(model.label || model.upstream) + "</div>" +
         '<div class="tiny dim mono">' + esc(model.id) + "</div></td>" +
         "<td>" + esc(mediaLabel(model.media)) + "</td>" +

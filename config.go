@@ -92,6 +92,34 @@ type Config struct {
 	// IncludeWatermark requests Miora's watermarked variant of the result.
 	IncludeWatermark bool `yaml:"include_watermark" json:"include_watermark"`
 
+	// --- Agent (ACP chat) settings -------------------------------------------
+	// AgentEnabled exposes Miora's agent models (deepseek, glm, kimi, gpt …)
+	// through the ACP bridge. Media models are unaffected either way.
+	AgentEnabled bool `yaml:"agent_enabled" json:"agent_enabled"`
+
+	// AgentDefaultModel serves requests that name a model outside the catalogue.
+	AgentDefaultModel string `yaml:"agent_default_model" json:"agent_default_model"`
+
+	// AgentModels adds model IDs to the advertised agent catalogue.
+	AgentModels []string `yaml:"agent_models" json:"agent_models"`
+
+	// AgentProjectID pins the Miora project used for the sandbox. Empty lets the
+	// plugin reuse or create a project titled AgentProjectTitle.
+	AgentProjectID string `yaml:"agent_project_id" json:"agent_project_id"`
+
+	// AgentProjectTitle is the project name the plugin creates/owns.
+	AgentProjectTitle string `yaml:"agent_project_title" json:"agent_project_title"`
+
+	// AgentMode is the ACP session mode. bypassPermissions avoids the interactive
+	// tool-approval prompt that a stateless proxy cannot answer.
+	AgentMode string `yaml:"agent_mode" json:"agent_mode"`
+
+	// AgentTimeoutSeconds bounds one agent turn.
+	AgentTimeoutSeconds int `yaml:"agent_timeout_seconds" json:"agent_timeout_seconds"`
+
+	// AgentRuntimeTTLMinutes is how long a provisioned sandbox is reused.
+	AgentRuntimeTTLMinutes int `yaml:"agent_runtime_ttl_minutes" json:"agent_runtime_ttl_minutes"`
+
 	// ResponseFooter appends a compact metadata line to the assistant message.
 	ResponseFooter bool `yaml:"response_footer" json:"response_footer"`
 }
@@ -106,20 +134,26 @@ type ModelConfig struct {
 
 func defaultConfig() *Config {
 	return &Config{
-		BaseURL:               "https://miora.design",
-		Language:              "zh-CN",
-		RequestTimeoutSeconds: 60,
-		PollIntervalSeconds:   4,
-		TaskTimeoutSeconds:    420,
-		MaxConcurrentTasks:    4,
-		DefaultVideoSeconds:   5,
-		CatalogTTLMinutes:     30,
-		AutoRefreshHours:      24,
-		EventLogSize:          200,
-		UploadReferenceImages: false,
-		UseHostHTTP:           true,
-		EnableBrowserImport:   true,
-		ResponseFooter:        true,
+		BaseURL:                "https://miora.design",
+		Language:               "zh-CN",
+		RequestTimeoutSeconds:  60,
+		PollIntervalSeconds:    4,
+		TaskTimeoutSeconds:     420,
+		MaxConcurrentTasks:     4,
+		DefaultVideoSeconds:    5,
+		CatalogTTLMinutes:      30,
+		AutoRefreshHours:       24,
+		EventLogSize:           200,
+		UploadReferenceImages:  false,
+		AgentEnabled:           true,
+		AgentDefaultModel:      agentDefaultModelID,
+		AgentProjectTitle:      "CPA 会话",
+		AgentMode:              agentBypassMode,
+		AgentTimeoutSeconds:    180,
+		AgentRuntimeTTLMinutes: 120,
+		UseHostHTTP:            true,
+		EnableBrowserImport:    true,
+		ResponseFooter:         true,
 	}
 }
 
@@ -168,6 +202,25 @@ func (c *Config) normalize() {
 	if c.EventLogSize <= 0 {
 		c.EventLogSize = 200
 	}
+	c.AgentDefaultModel = strings.TrimSpace(c.AgentDefaultModel)
+	if c.AgentDefaultModel == "" {
+		c.AgentDefaultModel = agentDefaultModelID
+	}
+	c.AgentProjectID = strings.TrimSpace(c.AgentProjectID)
+	if strings.TrimSpace(c.AgentProjectTitle) == "" {
+		c.AgentProjectTitle = "CPA 会话"
+	}
+	c.AgentMode = strings.TrimSpace(c.AgentMode)
+	if c.AgentMode == "" {
+		c.AgentMode = agentBypassMode
+	}
+	if c.AgentTimeoutSeconds <= 0 {
+		c.AgentTimeoutSeconds = 180
+	}
+	if c.AgentRuntimeTTLMinutes <= 0 {
+		c.AgentRuntimeTTLMinutes = 120
+	}
+	c.AgentModels = normalizeIDList(c.AgentModels)
 	c.IncludeModels = normalizeIDList(c.IncludeModels)
 	c.ExcludeModels = normalizeIDList(c.ExcludeModels)
 	c.BrowserProfiles = normalizeIDList(c.BrowserProfiles)

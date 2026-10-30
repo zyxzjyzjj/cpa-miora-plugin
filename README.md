@@ -16,7 +16,7 @@
 | --- | --- |
 | `auth_provider` | 登录态导入与轮换：一键读取本机 Edge / Chrome 里已登录的 miora.design 会话，或手动粘贴 token；插件自行负责 `refresh_token` 轮换并写回 auth 文件 |
 | `model_provider` | 拉取 Miora 官方媒体模型目录（免费档 42 个：24 图像 / 12 视频 / 6 个 3D），映射成 CPA 模型，附能力、比例、分辨率、参考图上限 |
-| `executor` | 把 `/v1/chat/completions` 请求翻译成 Miora 的异步生成任务：提交 → 轮询 → 签名产物 → 以 Markdown 媒体 + `miora` 结构化扩展返回；支持流式进度 |
+| `executor` | `/v1/chat/completions` 双模：媒体模型走“提交 → 轮询 → 签名 → Markdown 媒体”；Agent 模型走 ACP over HTTP+SSE，返回文本与真实 usage |
 | `quota_provider` | 用 `/api/ai/quota/credit` 的真实余额填充 CPA 的额度视图 |
 | `usage_plugin` | 记录每次请求的账号 / 模型 / 耗时 / 扣费，进面板日志 |
 | `scheduler` | 多账号轮转，降低单账号并发与频控压力 |
@@ -24,9 +24,31 @@
 
 ### 不做
 
-**没有 chat 反代。** Miora 的 LLM 是**有状态云端 Agent**：每次请求要 `runtimeId`（绑 projectId）+ `acpLink` 临时 token，工具调用需要 Socket.IO 上的人工审批（`TOOL_CONFIRMATION_PENDING`），协议是 ACP JSON-RPC。OpenAI 的 chat 协议是无状态的，二者不存在可靠的转换路径——强行做只会得到一个随时卡死的假 chat。
+早期版本只反代了 Miora 的**媒体生成**（REST、无状态）。从 v0.2.0 起，**Agent 对话模型**（`deepseek-v4.1-flash`、`glm-5.3`、`kimi-k3`、`gpt-6-astra`、`gpt-5.6-sol`、`gemini-3.8-flash` 等）也走同一个 `/v1/chat/completions`——它们背后是项目级 ACP（Agent Client Protocol）：
 
-所以本插件反代的是 Miora **真正开放、无状态、可自动化**的部分：媒体生成。对客户端而言一样是标准 `/v1/chat/completions`，只是回复里给的是图片 / 视频 / 3D 文件而不是文字。
+```text
+POST /api/ai/cloud-agent/runtimes        {"projectId":…}      → {id, links.acpLink{url,token}}
+POST {acpLink.url}/bootstrap             {initialize, sessionNew}
+                                         → sessionId + 模型清单 + modes
+POST {acpLink.url}/bootstrap             {initialize, sessionLoad, setModel, setMode, prompt}
+                                         → agent_message_chunk 增量 + usage
+```
+
+插件负责：按账号复用/创建项目与沙箱、每轮新开 `session/new` 并在结束后 `session/close`、
+把客户端多轮 messages 渲染成 `<对话历史>` 提示词、把增量映射成 OpenAI chunk、把真实 token 数写进 `usage`，
+并在沙箱异常时自动重建运行时。会话默认 `bypassPermissions`，因为无状态代理没法点击工具审批框。
+
+| | 媒体模型（图像 / 视频 / 3D） | Agent 对话模型 |
+| --- | --- | --- |
+| 来源 | `cloud-agent/media-models` | `cloud-agent/tiers` + 运行时 `availableModels` |
+| 传输 | REST 提交 + 轮询 + 签名 | ACP over HTTP + SSE |
+| 回复 | Markdown 媒体 + `miora.files` | 文本 + `usage` |
+| 开关 | 始终启用 | `agent_enabled: true`（默认） |
+| 冷启动 | 无 | 首次 10–30s（沙箱） |
+| 输入 token | — | 每轮 4.9 万起（Agent 自带大系统提示词） |
+
+> 同一 Miora 项目下上下文会累积（站点本身的设计）。需要隔离就给不同部署配不同的 `agent_project_id`。
+> 一个沙箱同一时刻只服务一个会话，插件按账号串行化。
 
 ---
 
@@ -345,3 +367,4 @@ go vet ./...
 ## 11. 说明
 
 本项目用于互操作性研究与本地集成。Miora 的协议、模型与额度归其平台方所有；请遵守其服务条款，不要用于绕过计费或批量滥用。插件不存储、不上传你的浏览器数据：登录态只在内存与 CPA 的 auth 文件之间流动。
+
