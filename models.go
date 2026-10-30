@@ -63,6 +63,8 @@ func registrationConfigFields() []pluginapi.ConfigField {
 		field("agent_mode", pluginapi.ConfigFieldTypeEnum, "ACP 会话模式，bypassPermissions 可免去工具审批。"),
 		field("agent_timeout_seconds", pluginapi.ConfigFieldTypeInteger, "单轮 Agent 对话超时。"),
 		field("agent_runtime_ttl_minutes", pluginapi.ConfigFieldTypeInteger, "Agent 沙箱复用时长。"),
+		field("agent_context_length", pluginapi.ConfigFieldTypeInteger, "对外声明的 Agent 上下文窗口（Miora 不公开，过小会触发 context overflow）。"),
+		field("agent_max_prompt_tokens", pluginapi.ConfigFieldTypeInteger, "项目记忆的 token 预算，超过后自动换新项目（重置记忆、提速）。"),
 		field("response_footer", pluginapi.ConfigFieldTypeBoolean, "在回复末尾追加紧凑的生成信息。"),
 		field("catalog_ttl_minutes", pluginapi.ConfigFieldTypeInteger, "模型目录缓存时长。"),
 		field("auto_refresh_hours", pluginapi.ConfigFieldTypeInteger, "提前多少小时轮换即将过期的 token。"),
@@ -215,7 +217,10 @@ func agentModelInfos(cfg *Config, now int64) []pluginapi.ModelInfo {
 		}
 		contextLength := model.MaxInput
 		if contextLength <= 0 {
-			contextLength = 200000
+			contextLength = int64(cfg.AgentContextLength)
+		}
+		if contextLength <= 0 {
+			contextLength = 1000000
 		}
 		maxOutput := model.MaxOutput
 		if maxOutput <= 0 {

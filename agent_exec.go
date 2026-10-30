@@ -66,6 +66,18 @@ func runAgentTurn(ctx context.Context, cfg *Config, plan *executionPlan, onDelta
 	}
 	text := builder.String()
 	logInfo("agent turn artifacts: "+strconv.Itoa(len(artifacts)), map[string]any{"model": plan.model})
+
+	// Miora keeps every round in the project, so prompt tokens grow with history
+	// (49k -> 245k measured) and each turn gets slower. Once the budget is spent,
+	// move the account to a fresh project: memory resets and turns speed up again.
+	if budget := cfg.effectiveMaxPromptTokens(); budget > 0 && usage != nil && usage.InputTokens > int64(budget) {
+		logInfo("agent memory budget reached, rotating project", map[string]any{
+			"prompt_tokens": usage.InputTokens,
+			"budget":        budget,
+		})
+		forgetState(agentAccountKey(cfg, plan.cred))
+		forgetAgentRuntime(cfg, plan.cred)
+	}
 	// Design tools (image / video / 3D) return artifacts out of band; surface them
 	// so a chat client actually sees what the agent produced.
 	if markdown := artifactMarkdown(artifacts); markdown != "" {

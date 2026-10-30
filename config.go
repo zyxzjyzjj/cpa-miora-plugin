@@ -120,6 +120,18 @@ type Config struct {
 	// AgentRuntimeTTLMinutes is how long a provisioned sandbox is reused.
 	AgentRuntimeTTLMinutes int `yaml:"agent_runtime_ttl_minutes" json:"agent_runtime_ttl_minutes"`
 
+	// AgentContextLength is the context window advertised for agent models. Miora
+	// does not publish a window, and one turn already ships ~50k tokens of built-in
+	// system prompt, so under-declaring it makes clients reject replies as
+	// "context overflow" while the upstream is perfectly happy.
+	AgentContextLength int `yaml:"agent_context_length" json:"agent_context_length"`
+
+	// AgentMaxPromptTokens caps the accumulated project memory. Miora keeps every
+	// round in the project, so prompt tokens grow each turn (measured 49k -> 245k);
+	// once a turn exceeds this budget the plugin moves the account onto a fresh
+	// project, which resets memory and makes later turns several times faster.
+	AgentMaxPromptTokens int `yaml:"agent_max_prompt_tokens" json:"agent_max_prompt_tokens"`
+
 	// ResponseFooter appends a compact metadata line to the assistant message.
 	ResponseFooter bool `yaml:"response_footer" json:"response_footer"`
 }
@@ -151,6 +163,8 @@ func defaultConfig() *Config {
 		AgentMode:              agentBypassMode,
 		AgentTimeoutSeconds:    420,
 		AgentRuntimeTTLMinutes: 120,
+		AgentContextLength:     1000000,
+		AgentMaxPromptTokens:   150000,
 		UseHostHTTP:            false,
 		EnableBrowserImport:    true,
 		ResponseFooter:         true,
@@ -219,6 +233,12 @@ func (c *Config) normalize() {
 	}
 	if c.AgentRuntimeTTLMinutes <= 0 {
 		c.AgentRuntimeTTLMinutes = 120
+	}
+	if c.AgentContextLength <= 0 {
+		c.AgentContextLength = 1000000
+	}
+	if c.AgentMaxPromptTokens <= 0 {
+		c.AgentMaxPromptTokens = 150000
 	}
 	c.AgentModels = normalizeIDList(c.AgentModels)
 	c.IncludeModels = normalizeIDList(c.IncludeModels)
@@ -396,4 +416,15 @@ func (c *Config) validate() error {
 		return fmt.Errorf("proxy_url must be an http(s) URL or direct://")
 	}
 	return nil
+}
+
+// effectiveMaxPromptTokens returns the project memory budget in tokens.
+func (c *Config) effectiveMaxPromptTokens() int {
+	if c == nil {
+		return 150000
+	}
+	if c.AgentMaxPromptTokens > 0 {
+		return c.AgentMaxPromptTokens
+	}
+	return 150000
 }
