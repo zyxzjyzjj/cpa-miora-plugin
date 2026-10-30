@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -104,12 +105,20 @@ type httpResult struct {
 // bridge is unavailable (unit tests, ABI harness) it falls back to a direct
 // client.
 func doUpstream(ctx context.Context, cfg *Config, method, rawURL string, headers http.Header, body []byte) (*httpResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	useHost := cfg == nil || cfg.UseHostHTTP
 	if useHost {
 		result, errHost := doUpstreamViaHost(ctx, method, rawURL, headers, body)
 		recordUpstreamTrace("host", method, rawURL, statusOf(result), errHost)
 		if errHost == nil && !gatewayRejected(result) {
 			return result, nil
+		}
+		// A timeout or callback failure may happen after a billable POST reached
+		// Miora. Retrying through another transport can create a duplicate task.
+		if errHost != nil && !errors.Is(errHost, errHostUnavailable) {
+			return nil, errHost
 		}
 		if errHost == nil {
 			// Some deployments put a gateway in front of the host transport that
@@ -141,11 +150,9 @@ func gatewayRejected(result *httpResult) bool {
 		return false
 	}
 	switch result.StatusCode {
-	case http.StatusMethodNotAllowed, http.StatusNotImplemented, http.StatusBadGateway, http.StatusGatewayTimeout:
+	case http.StatusMethodNotAllowed, http.StatusNotImplemented:
 	default:
-		if result.StatusCode < 400 {
-			return false
-		}
+		return false
 	}
 	contentType := strings.ToLower(result.Headers.Get("Content-Type"))
 	return strings.Contains(contentType, "html") || strings.HasPrefix(strings.TrimSpace(string(result.Body)), "<")
@@ -202,19 +209,40 @@ func doUpstreamViaHost(ctx context.Context, method, rawURL string, headers http.
 	}
 }
 
-var directHTTPClient = &http.Client{Timeout: 120 * time.Second}
+var directTransportCache struct {
+	sync.Mutex
+	proxy     string
+	transport *http.Transport
+}
+
+func directTransport(proxy string) *http.Transport {
+	if proxy == "" {
+		return http.DefaultTransport.(*http.Transport)
+	}
+	directTransportCache.Lock()
+	defer directTransportCache.Unlock()
+	if directTransportCache.transport != nil && directTransportCache.proxy == proxy {
+		return directTransportCache.transport
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if strings.EqualFold(proxy, "direct://") {
+		transport.Proxy = nil
+	} else if proxyURL, errParse := url.Parse(proxy); errParse == nil {
+		transport.Proxy = http.ProxyURL(proxyURL)
+	}
+	if previous := directTransportCache.transport; previous != nil {
+		previous.CloseIdleConnections()
+	}
+	directTransportCache.proxy, directTransportCache.transport = proxy, transport
+	return transport
+}
 
 func doUpstreamDirect(ctx context.Context, cfg *Config, method, rawURL string, headers http.Header, body []byte) (*httpResult, error) {
-	client := directHTTPClient
-	if cfg != nil && cfg.ProxyURL != "" {
-		transport := http.DefaultTransport.(*http.Transport).Clone()
-		if strings.EqualFold(cfg.ProxyURL, "direct://") {
-			transport.Proxy = nil
-		} else if proxyURL, errParse := url.Parse(cfg.ProxyURL); errParse == nil {
-			transport.Proxy = http.ProxyURL(proxyURL)
-		}
-		client = &http.Client{Timeout: cfg.requestTimeout(), Transport: transport}
+	proxy := ""
+	if cfg != nil {
+		proxy = cfg.ProxyURL
 	}
+	client := &http.Client{Timeout: cfg.requestTimeout(), Transport: directTransport(proxy)}
 	req, errNew := http.NewRequestWithContext(ctx, method, rawURL, bytes.NewReader(body))
 	if errNew != nil {
 		return nil, errNew
@@ -759,8 +787,18 @@ func (c *apiClient) pollTasks(ctx context.Context, media string, ids []string) (
 	if media == mediaImage {
 		if data, errQuery := c.requestJSON(ctx, http.MethodPost, pathImageQuery, nil, map[string]any{"taskIds": ids}, true); errQuery == nil {
 			mergeTaskMap(states, data)
-		} else if errAuth := asAuthError(errQuery); errAuth != nil {
-			return nil, errAuth
+			complete := true
+			for _, id := range ids {
+				if _, ok := states[id]; !ok {
+					complete = false
+					break
+				}
+			}
+			if complete {
+				return states, nil
+			}
+		} else {
+			return nil, errQuery
 		}
 	}
 
@@ -786,8 +824,8 @@ func (c *apiClient) pollTasks(ctx context.Context, media string, ids []string) (
 		} else {
 			mergeTaskMap(states, data)
 		}
-	} else if errAuth := asAuthError(errProgress); errAuth != nil {
-		return nil, errAuth
+	} else {
+		return nil, errProgress
 	}
 
 	if len(states) == 0 {

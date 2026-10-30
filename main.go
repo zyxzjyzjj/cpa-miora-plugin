@@ -49,6 +49,10 @@ extern void cliproxyPluginShutdown(void);
 
 static const cliproxy_host_api* mioraHostApi;
 
+static int host_api_available(void) {
+	return mioraHostApi != NULL && mioraHostApi->call != NULL;
+}
+
 static void store_host_api(const cliproxy_host_api* host) {
 	mioraHostApi = host;
 }
@@ -70,6 +74,7 @@ import "C"
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -175,6 +180,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return nil, fmt.Errorf("parse plugin config: %w", errConfig)
 		}
 		currentConfig.Store(cfg)
+		invalidateCatalog()
 		startBackground(cfg)
 		if logSink != nil {
 			logSink.info("plugin registered", map[string]any{
@@ -187,6 +193,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 
 	case pluginabi.MethodPluginQuiesce, pluginabi.MethodPluginShutdown:
 		stopBackground()
+		stopLoginSessions()
 		return okEnvelope(map[string]any{})
 
 	case pluginabi.MethodModelRegister:
@@ -248,6 +255,8 @@ type hostCallFunc func(string, any) (json.RawMessage, error)
 
 var hostCallSlot atomic.Value
 
+var errHostUnavailable = errors.New("host callback is unavailable")
+
 func hostCall(method string, request any) (json.RawMessage, error) {
 	fn, _ := hostCallSlot.Load().(hostCallFunc)
 	if fn == nil {
@@ -271,6 +280,9 @@ func setHostCall(fn hostCallFunc) func() {
 }
 
 func callHostABI(method string, request any) (json.RawMessage, error) {
+	if C.host_api_available() == 0 {
+		return nil, errHostUnavailable
+	}
 	payload, errMarshal := json.Marshal(request)
 	if errMarshal != nil {
 		return nil, fmt.Errorf("marshal host request %s: %w", method, errMarshal)

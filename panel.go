@@ -526,7 +526,8 @@ const panelTemplate = `<!doctype html>
   var BASE = "/v0/management/" + P;
   var PANEL_STORE = "cli-proxy-auth";
   var ENC_PREFIX = "enc::v1::";
-  var SECRET_SALT = "cli-proxy-api-webui::secure-storage";
+  // Compatibility with the host's XOR-obfuscated storage, not an encryption key.
+  var STORAGE_SALT = "cli-proxy-api-webui::secure-storage";
   var SS_KEY = P + "-mgmt-key";
 
   var state = {
@@ -559,7 +560,7 @@ const panelTemplate = `<!doctype html>
   function deobfuscate(value) {
     if (!value || value.indexOf(ENC_PREFIX) !== 0) { return value; }
     try {
-      var key = encBytes(SECRET_SALT + "|" + window.location.host + "|" + window.navigator.userAgent);
+      var key = encBytes(STORAGE_SALT + "|" + window.location.host + "|" + window.navigator.userAgent);
       return new TextDecoder().decode(xorBytes(base64Bytes(value.slice(ENC_PREFIX.length)), key));
     } catch (e) { return value; }
   }
@@ -575,12 +576,12 @@ const panelTemplate = `<!doctype html>
     } catch (e) { return null; }
   }
   function urlKey() {
-    var query = new URLSearchParams(window.location.search);
-    if (!query.has("key")) { return null; }
-    var value = (query.get("key") || "").trim();
-    query.delete("key");
-    var rest = query.toString();
-    window.history.replaceState(null, "", window.location.pathname + (rest ? "?" + rest : "") + window.location.hash);
+    var fragment = new URLSearchParams(window.location.hash.slice(1));
+    if (!fragment.has("key")) { return null; }
+    var value = (fragment.get("key") || "").trim();
+    fragment.delete("key");
+    var rest = fragment.toString();
+    window.history.replaceState(null, "", window.location.pathname + window.location.search + (rest ? "#" + rest : ""));
     return value || null;
   }
   var initialURLKey = urlKey();

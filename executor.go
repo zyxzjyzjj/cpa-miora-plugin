@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -330,7 +331,7 @@ type executionPlan struct {
 var aspectRatioPattern = regexp.MustCompile(`\b(\d{1,2}):(\d{1,2})\b`)
 
 // planExecution normalises one executor call into concrete generation requests.
-func planExecution(cfg *Config, req *executorRequest) (*executionPlan, error) {
+func planExecution(ctx context.Context, cfg *Config, req *executorRequest) (*executionPlan, error) {
 	parsed, errParse := parseChatPayload(req.Payload)
 	if errParse != nil {
 		return nil, errParse
@@ -359,11 +360,11 @@ func planExecution(cfg *Config, req *executorRequest) (*executionPlan, error) {
 		stream:   req.Stream,
 		streamID: req.StreamID,
 	}
+	generation, errPlan := buildGeneration(ctx, cfg, cred, parsed, model, media)
+	if errPlan != nil {
+		return nil, errPlan
+	}
 	for index := 0; index < parsed.Count; index++ {
-		generation, errPlan := buildGeneration(cfg, cred, parsed, model, media)
-		if errPlan != nil {
-			return nil, errPlan
-		}
 		plan.generations = append(plan.generations, generation)
 	}
 	return plan, nil
@@ -418,8 +419,8 @@ func mediaFamily(value string) string {
 }
 
 func firstAvailableModel(cfg *Config, media string) string {
-	snapshot := peekCatalog()
-	for _, model := range snapshot.Models {
+	models := catalogueModels(cfg)
+	for _, model := range models {
 		if model.mediaKind() != media {
 			continue
 		}
@@ -427,7 +428,7 @@ func firstAvailableModel(cfg *Config, media string) string {
 			return model.ModelID
 		}
 	}
-	for _, model := range snapshot.Models {
+	for _, model := range models {
 		if model.mediaKind() == media && cfg.modelAllowed(model.ModelID) {
 			return model.ModelID
 		}
@@ -436,7 +437,7 @@ func firstAvailableModel(cfg *Config, media string) string {
 }
 
 // buildGeneration applies model capabilities to one concrete generation.
-func buildGeneration(cfg *Config, cred *credential, parsed *parsedChat, model, media string) (generateRequest, error) {
+func buildGeneration(ctx context.Context, cfg *Config, cred *credential, parsed *parsedChat, model, media string) (generateRequest, error) {
 	catalogModel, known := findCatalogModel(model)
 	generation := generateRequest{
 		Model:  model,
@@ -463,7 +464,7 @@ func buildGeneration(cfg *Config, cred *credential, parsed *parsedChat, model, m
 		generation.Footnote = "0"
 	}
 
-	keys, errKeys := resolveReferenceKeys(context.Background(), cfg, newAPIClient(cfg, cred), parsed.Images, catalogModel, media)
+	keys, errKeys := resolveReferenceKeys(ctx, cfg, newAPIClient(cfg, cred), parsed.Images, catalogModel, media)
 	if errKeys != nil {
 		return generateRequest{}, errKeys
 	}
@@ -525,7 +526,7 @@ func resolveReferenceKeys(ctx context.Context, cfg *Config, client *apiClient, i
 			if !cfg.UploadReferenceImages {
 				return nil, fmt.Errorf("参考图需要先转成 Miora 的文件，请在插件配置里开启 upload_reference_images 后重试")
 			}
-			key, errUpload := uploadReferenceImage(ctx, cfg, nil, trimmed)
+			key, errUpload := uploadReferenceImage(ctx, cfg, client, trimmed)
 			if errUpload != nil {
 				return nil, fmt.Errorf("参考图上传失败：%w", errUpload)
 			}
@@ -702,19 +703,18 @@ func executorExecute(request []byte) ([]byte, error) {
 		return nil, errDecode
 	}
 	cfg := config()
-	plan, errPlan := planExecution(cfg, req)
-	if errPlan != nil {
-		logWarn("executor plan failed", map[string]any{"error": errPlan.Error()})
-		return executionFailure(errPlan)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.taskTimeout()+30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	release, errPermit := acquirePermit(ctx, cfg)
 	if errPermit != nil {
 		return failEnvelope("busy", "生成并发已满，请稍后重试", http.StatusTooManyRequests)
 	}
 	defer release()
+	plan, errPlan := planExecution(ctx, cfg, req)
+	if errPlan != nil {
+		logWarn("executor plan failed", map[string]any{"error": errPlan.Error()})
+		return executionFailure(errPlan)
+	}
 
 	results := make([]*generationResult, 0, len(plan.generations))
 	for _, generation := range plan.generations {
@@ -740,18 +740,7 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 		return nil, errDecode
 	}
 	cfg := config()
-	plan, errPlan := planExecution(cfg, req)
-	if errPlan != nil {
-		logWarn("executor stream plan failed", map[string]any{"error": errPlan.Error()})
-		if strings.TrimSpace(req.StreamID) != "" {
-			emitStreamError(req.StreamID, errPlan.Error())
-			closeStream(req.StreamID)
-			return okEnvelope(map[string]any{"headers": streamHeaders()})
-		}
-		return executionFailure(errPlan)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.taskTimeout()+30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	release, errPermit := acquirePermit(ctx, cfg)
 	if errPermit != nil {
@@ -764,6 +753,18 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 	}
 	defer release()
 
+	plan, errPlan := planExecution(ctx, cfg, req)
+	if errPlan != nil {
+		logWarn("executor stream plan failed", map[string]any{"error": errPlan.Error()})
+		if strings.TrimSpace(req.StreamID) != "" {
+			emitStreamError(req.StreamID, errPlan.Error())
+			closeStream(req.StreamID)
+			return okEnvelope(map[string]any{"headers": streamHeaders()})
+		}
+		return executionFailure(errPlan)
+	}
+
+	stream := completionStream{id: completionID(), model: req.Model, created: time.Now().Unix()}
 	// Buffered mode: the host did not allocate a stream, so aggregate and return
 	// the chunks inline exactly as a lower-level SSE translator would.
 	if strings.TrimSpace(req.StreamID) == "" {
@@ -776,14 +777,14 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 			results = append(results, result)
 		}
 		chunks := make([]pluginapi.ExecutorStreamChunk, 0, 4)
-		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: chunkRole(req.Model)})
-		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: chunkContent(req.Model, renderResults(cfg, results))})
-		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: chunkFinal(req.Model, "stop")})
+		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: stream.chunkRole()})
+		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: stream.chunkContent(renderResults(cfg, results))})
+		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: stream.chunkFinal("stop")})
 		return okEnvelope(map[string]any{"headers": streamHeaders(), "chunks": chunks})
 	}
 
 	streamID := req.StreamID
-	if errEmit := hostStreamEmit(streamID, chunkRole(req.Model)); errEmit != nil {
+	if errEmit := hostStreamEmit(streamID, stream.chunkRole()); errEmit != nil {
 		closeStream(streamID)
 		return nil, fmt.Errorf("emit role chunk: %w", errEmit)
 	}
@@ -795,7 +796,9 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 			if text == "" {
 				return
 			}
-			_ = hostStreamEmit(streamID, chunkContent(req.Model, text))
+			if errEmit := hostStreamEmit(streamID, stream.chunkContent(text)); errEmit != nil {
+				cancel()
+			}
 		}
 		result, errGeneration := runGeneration(ctx, cfg, plan.cred, generation, progress)
 		if errGeneration != nil {
@@ -806,11 +809,11 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 		results = append(results, result)
 	}
 
-	if errEmit := hostStreamEmit(streamID, chunkContent(req.Model, renderResults(cfg, results))); errEmit != nil {
+	if errEmit := hostStreamEmit(streamID, stream.chunkContent(renderResults(cfg, results))); errEmit != nil {
 		closeStream(streamID)
 		return nil, fmt.Errorf("emit content chunk: %w", errEmit)
 	}
-	_ = hostStreamEmit(streamID, chunkFinal(req.Model, "stop"))
+	_ = hostStreamEmit(streamID, stream.chunkFinal("stop"))
 	closeStream(streamID)
 	return okEnvelope(map[string]any{"headers": streamHeaders()})
 }
@@ -837,14 +840,7 @@ func executionFailure(err error) ([]byte, error) {
 }
 
 func asUpstream(err error, target **upstreamError) bool {
-	if err == nil {
-		return false
-	}
-	if value, ok := err.(*upstreamError); ok {
-		*target = value
-		return true
-	}
-	return false
+	return errors.As(err, target)
 }
 
 func streamHeaders() http.Header {
@@ -964,19 +960,25 @@ func completionID() string {
 	return "chatcmpl-miora-" + randomHex(8)
 }
 
-func chunkRole(model string) []byte {
-	return chunkFrame(model, map[string]any{"role": "assistant"}, "")
+type completionStream struct {
+	id      string
+	model   string
+	created int64
 }
 
-func chunkContent(model, text string) []byte {
-	return chunkFrame(model, map[string]any{"content": text}, "")
+func (s completionStream) chunkRole() []byte {
+	return s.chunkFrame(map[string]any{"role": "assistant"}, "")
 }
 
-func chunkFinal(model, reason string) []byte {
-	return chunkFrame(model, map[string]any{}, reason)
+func (s completionStream) chunkContent(text string) []byte {
+	return s.chunkFrame(map[string]any{"content": text}, "")
 }
 
-func chunkFrame(model string, delta map[string]any, finishReason string) []byte {
+func (s completionStream) chunkFinal(reason string) []byte {
+	return s.chunkFrame(map[string]any{}, reason)
+}
+
+func (s completionStream) chunkFrame(delta map[string]any, finishReason string) []byte {
 	choice := map[string]any{
 		"index":         0,
 		"delta":         delta,
@@ -986,10 +988,10 @@ func chunkFrame(model string, delta map[string]any, finishReason string) []byte 
 		choice["finish_reason"] = finishReason
 	}
 	frame := map[string]any{
-		"id":      completionID(),
+		"id":      s.id,
 		"object":  "chat.completion.chunk",
-		"created": time.Now().Unix(),
-		"model":   model,
+		"created": s.created,
+		"model":   s.model,
 		"choices": []map[string]any{choice},
 	}
 	raw, _ := json.Marshal(frame)

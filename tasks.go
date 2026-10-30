@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -163,39 +164,54 @@ func listEvents(limit int) []eventRecord {
 // generation can take minutes, so an unbounded executor would hold a CPA worker
 // (and an upstream slot) per request.
 func acquirePermit(ctx context.Context, cfg *Config) (func(), error) {
-	limit := 4
-	if cfg != nil && cfg.MaxConcurrentTasks > 0 {
-		limit = cfg.MaxConcurrentTasks
-	}
-	if limit < 1 {
-		limit = 1
-	}
-	if limit > 64 {
-		limit = 64
-	}
-	semaphore := permitSemaphore(limit)
-	select {
-	case semaphore <- struct{}{}:
-		return func() { <-semaphore }, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	ctx, cancel := context.WithTimeout(ctx, cfg.taskTimeout()+30*time.Second)
+	defer cancel()
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		generationPermits.mu.Lock()
+		changed := generationPermits.changed
+		generationPermits.mu.Unlock()
+		limit := cfg.MaxConcurrentTasks
+		if active := currentConfig.Load(); active != nil {
+			limit = active.MaxConcurrentTasks
+		}
+		if release, ok := generationPermits.acquire(limit); ok {
+			return release, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-changed:
+		}
 	}
 }
 
-var permitRegistry = struct {
-	mu    sync.Mutex
-	semis map[int]chan struct{}
-}{semis: map[int]chan struct{}{}}
+// A single active count spans configuration changes; lowering the limit waits
+// for existing tasks to finish instead of creating another independent pool.
+type generationLimiter struct {
+	mu      sync.Mutex
+	active  int
+	changed chan struct{}
+}
 
-func permitSemaphore(limit int) chan struct{} {
-	permitRegistry.mu.Lock()
-	defer permitRegistry.mu.Unlock()
-	if semaphore, ok := permitRegistry.semis[limit]; ok {
-		return semaphore
+var generationPermits = generationLimiter{changed: make(chan struct{})}
+
+func (l *generationLimiter) acquire(limit int) (func(), bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.active >= limit {
+		return nil, false
 	}
-	semaphore := make(chan struct{}, limit)
-	permitRegistry.semis[limit] = semaphore
-	return semaphore
+	l.active++
+	return func() {
+		l.mu.Lock()
+		l.active--
+		close(l.changed)
+		l.changed = make(chan struct{})
+		l.mu.Unlock()
+	}, true
 }
 
 // progressFunc receives intermediate task progress for streamed responses.
@@ -203,10 +219,11 @@ type progressFunc func(status string, progress float64, note string)
 
 // runGeneration submits a media generation, waits for the terminal state, signs
 // the produced artifacts and records the task.
-func runGeneration(ctx context.Context, cfg *Config, cred *credential, req generateRequest, onProgress progressFunc) (*generationResult, error) {
+func runGeneration(ctx context.Context, cfg *Config, cred *credential, req generateRequest, onProgress progressFunc) (_ *generationResult, runErr error) {
+	ctx, cancel := context.WithTimeout(ctx, cfg.taskTimeout())
+	defer cancel()
 	started := time.Now()
 	client := newAPIClient(cfg, cred)
-
 	if onProgress != nil {
 		onProgress("submitting", 0, "已提交到 Miora")
 	}
@@ -219,35 +236,47 @@ func runGeneration(ctx context.Context, cfg *Config, cred *credential, req gener
 		})
 		return nil, errSubmit
 	}
-
-	deadline := started.Add(cfg.taskTimeout())
-	interval := cfg.pollInterval()
+	// Every exit after submission leaves a terminal row, including cancellation
+	// during a request, a polling sleep, or result signing.
+	defer func() {
+		if runErr == nil {
+			return
+		}
+		status := "failed"
+		if errors.Is(runErr, context.DeadlineExceeded) {
+			status = "timeout"
+			runErr = fmt.Errorf("等待 Miora 任务 %s 超时，上游任务可能仍在运行：%w", taskID, runErr)
+		} else if errors.Is(runErr, context.Canceled) {
+			status = "cancelled"
+		}
+		recordTask(taskRecord{
+			ID: taskID, TaskID: taskID, Account: cred.displayLabel(), Model: req.Model,
+			Media: req.Media, Prompt: truncateRunes(req.Prompt, 400), Status: status,
+			Error: runErr.Error(), StartedAt: started, FinishedAt: time.Now(),
+			ElapsedMS: time.Since(started).Milliseconds(),
+		})
+		recordEvent(eventRecord{
+			Time: time.Now(), Account: cred.displayLabel(), Model: req.Model, Media: req.Media,
+			Prompt: truncateRunes(req.Prompt, 160), Status: status, TaskID: taskID,
+			Error: runErr.Error(), ElapsedMS: time.Since(started).Milliseconds(),
+		})
+	}()
 	lastStatus := ""
 	lastProgress := 0.0
-	states := map[string]taskState{}
-
 	for {
-		select {
-		case <-ctx.Done():
-			recordTask(taskRecord{
-				ID: taskID, TaskID: taskID, Account: cred.displayLabel(), Model: req.Model,
-				Media: req.Media, Prompt: truncateRunes(req.Prompt, 400), Status: "cancelled",
-				StartedAt: started, FinishedAt: time.Now(),
-				ElapsedMS: time.Since(started).Milliseconds(),
-			})
-			return nil, ctx.Err()
-		default:
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-
-		polled, errPoll := client.pollTasks(ctx, req.Media, []string{taskID})
-		if errPoll == nil {
-			states = polled
+		states, errPoll := client.pollTasks(ctx, req.Media, []string{taskID})
+		if errPoll != nil {
+			var upstream *upstreamError
+			if errors.As(errPoll, &upstream) && (upstream.isAuthError() || upstream.Status >= 400 && upstream.Status < 500) {
+				return nil, errPoll
+			}
 		}
-		state, ok := states[taskID]
-		if ok {
+		if state, ok := states[taskID]; ok {
 			if state.Status != lastStatus || state.Progress != lastProgress {
-				lastStatus = state.Status
-				lastProgress = state.Progress
+				lastStatus, lastProgress = state.Status, state.Progress
 				upsertTask(taskRecord{
 					ID: taskID, TaskID: taskID, Account: cred.displayLabel(), Model: req.Model,
 					Media: req.Media, Prompt: truncateRunes(req.Prompt, 400), Status: state.Status,
@@ -259,34 +288,12 @@ func runGeneration(ctx context.Context, cfg *Config, cred *credential, req gener
 			}
 			if state.terminal() {
 				if state.failed() {
-					errTask := fmt.Errorf("Miora 任务失败：%s", firstNonEmpty(state.ErrorMessage, state.Status))
-					recordTask(taskRecord{
-						ID: taskID, TaskID: taskID, Account: cred.displayLabel(), Model: req.Model,
-						Media: req.Media, Prompt: truncateRunes(req.Prompt, 400), Status: "failed",
-						Error: errTask.Error(), StartedAt: started, FinishedAt: time.Now(),
-						ElapsedMS: time.Since(started).Milliseconds(),
-					})
-					recordEvent(eventRecord{
-						Time: time.Now(), Account: cred.displayLabel(), Model: req.Model, Media: req.Media,
-						Prompt: truncateRunes(req.Prompt, 160), Status: "failed", TaskID: taskID,
-						Error: errTask.Error(), ElapsedMS: time.Since(started).Milliseconds(),
-					})
-					return nil, errTask
+					return nil, fmt.Errorf("Miora 任务失败：%s", firstNonEmpty(state.ErrorMessage, state.Status))
 				}
 				return finalizeGeneration(ctx, cfg, client, cred, req, state, started)
 			}
 		}
-		if time.Now().After(deadline) {
-			errTimeout := fmt.Errorf("等待 Miora 任务超时（%s），任务 %s 仍在上游排队，可在面板产物里继续查看", cfg.taskTimeout(), taskID)
-			recordTask(taskRecord{
-				ID: taskID, TaskID: taskID, Account: cred.displayLabel(), Model: req.Model,
-				Media: req.Media, Prompt: truncateRunes(req.Prompt, 400), Status: "timeout",
-				Error: errTimeout.Error(), StartedAt: started, FinishedAt: time.Now(),
-				ElapsedMS: time.Since(started).Milliseconds(),
-			})
-			return nil, errTimeout
-		}
-		if errWait := sleepCtx(ctx, interval); errWait != nil {
+		if errWait := sleepCtx(ctx, cfg.pollInterval()); errWait != nil {
 			return nil, errWait
 		}
 	}
@@ -297,6 +304,9 @@ func finalizeGeneration(ctx context.Context, cfg *Config, client *apiClient, cre
 	keys := state.fileKeys()
 	signed, errSign := client.signURLs(ctx, keys)
 	if errSign != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		logWarn("result signing failed", map[string]any{"task": state.TaskID, "error": errSign.Error()})
 	}
 

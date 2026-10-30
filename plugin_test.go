@@ -209,7 +209,7 @@ func TestPlanExecutionPrefersLastUserTurn(t *testing.T) {
 	}
 
 	cred := &credential{AuthToken: "token"}
-	generation, errBuild := buildGeneration(cfg, cred, parsed, "hy-image-3.5-f", mediaImage)
+	generation, errBuild := buildGeneration(context.Background(), cfg, cred, parsed, "hy-image-3.5-f", mediaImage)
 	if errBuild != nil {
 		t.Fatalf("buildGeneration: %v", errBuild)
 	}
@@ -246,7 +246,7 @@ func TestBuildGenerationClampsVideoDuration(t *testing.T) {
 		},
 	}})
 	cfg := defaultConfig()
-	generation, errBuild := buildGeneration(cfg, &credential{AuthToken: "t"}, &parsedChat{Model: "vidu-q2-pro-video", Prompt: "waves", Duration: 99}, "vidu-q2-pro-video", mediaVideo)
+	generation, errBuild := buildGeneration(context.Background(), cfg, &credential{AuthToken: "t"}, &parsedChat{Model: "vidu-q2-pro-video", Prompt: "waves", Duration: 99}, "vidu-q2-pro-video", mediaVideo)
 	if errBuild != nil {
 		t.Fatalf("buildGeneration: %v", errBuild)
 	}
@@ -575,6 +575,7 @@ func TestLoginSessionLoopbackFlow(t *testing.T) {
 	if !started.OK || started.Result.URL == "" || started.Result.State == "" {
 		t.Fatalf("login start response incomplete: %s", string(raw))
 	}
+	t.Cleanup(stopLoginSessions)
 	if !strings.HasPrefix(started.Result.URL, "http://127.0.0.1:") {
 		t.Fatalf("login URL should be loopback: %s", started.Result.URL)
 	}
@@ -608,7 +609,10 @@ func TestLoginSessionLoopbackFlow(t *testing.T) {
 	token := fakeJWT(t, time.Now().Add(48*time.Hour))
 	submitBody, _ := json.Marshal(map[string]string{"auth_token": token})
 	submitURL := strings.TrimSuffix(started.Result.URL, "/?state="+started.Result.State) + "/api/submit"
-	submit, errSubmit := http.Post(submitURL, "application/json", bytes.NewReader(submitBody))
+	submitRequest, _ := http.NewRequest(http.MethodPost, submitURL, bytes.NewReader(submitBody))
+	submitRequest.Header.Set("Content-Type", "application/json")
+	submitRequest.Header.Set("X-Login-State", started.Result.State)
+	submit, errSubmit := http.DefaultClient.Do(submitRequest)
 	if errSubmit != nil {
 		t.Fatalf("submit: %v", errSubmit)
 	}

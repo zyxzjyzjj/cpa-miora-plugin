@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"net/url"
 	"sync"
 	"time"
 )
@@ -33,6 +35,11 @@ func recordUpstreamTrace(transport, method, rawURL string, status int, err error
 	}
 	if err != nil {
 		entry.Error = err.Error()
+		var requestError *url.Error
+		if errors.As(err, &requestError) {
+			// url.Error includes the original URL, including any CDN signature.
+			entry.Error = requestError.Err.Error()
+		}
 	}
 	upstreamTraces.mu.Lock()
 	defer upstreamTraces.mu.Unlock()
