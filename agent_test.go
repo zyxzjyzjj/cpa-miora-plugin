@@ -116,7 +116,7 @@ func TestAgentRuntimeSessionAndPrompt(t *testing.T) {
 	}
 
 	var deltas []string
-	usage, stopReason, errPrompt := runtime.prompt(ctx, cfg, session, "deepseek-v4.1-flash", "你好", func(delta string) error {
+	usage, stopReason, artifacts, errPrompt := runtime.prompt(ctx, cfg, session, "deepseek-v4.1-flash", "你好", func(delta string) error {
 		deltas = append(deltas, delta)
 		return nil
 	})
@@ -131,6 +131,9 @@ func TestAgentRuntimeSessionAndPrompt(t *testing.T) {
 	}
 	if usage == nil || usage.InputTokens != 123 || usage.OutputTokens != 9 {
 		t.Fatalf("usage not parsed from the result frame: %+v", usage)
+	}
+	if len(artifacts) != 0 {
+		t.Fatalf("no tool artifacts expected in a plain text turn: %v", artifacts)
 	}
 }
 
@@ -170,4 +173,22 @@ func withAgentCatalogue(t *testing.T, models []agentModel) {
 		agentModelCache.fetchedAt = previousFetched
 		agentModelCache.mu.Unlock()
 	})
+}
+
+func TestMediaURLsFromToolOutput(t *testing.T) {
+	// Shape captured from a real mcp__image_tools__image_gen completion.
+	raw := json.RawMessage(`{"text":"[{\"type\":\"text\",\"text\":\"{\\n  \\\"success\\\": true,\\n  \\\"images\\\": [\\n    {\\n      \\\"index\\\": 1,\\n      \\\"file_key\\\": \\\"file/741996331787679/2026/10/30/x/async-task/y.png\\\",\\n      \\\"access_url\\\": \\\"https://sign.miorausercontent.com/file/741996331787679/2026/10/30/x/async-task/y.png/wm_zhcn?sign=abc&t=1\\\"\\n    }\\n  ]\\n}\"}]","type":"text"}`)
+	urls := mediaURLsFromToolOutput(raw)
+	if len(urls) != 1 || !strings.HasPrefix(urls[0], "https://sign.miorausercontent.com/") {
+		t.Fatalf("artifact url not extracted: %v", urls)
+	}
+	if keys := toolFileKeys(raw); len(keys) != 1 || keys[0] != "file/741996331787679/2026/10/30/x/async-task/y.png" {
+		t.Fatalf("file key not extracted: %v", keys)
+	}
+	if got := artifactMarkdown(urls); !strings.Contains(got, "![Miora 生成](") {
+		t.Fatalf("markdown not rendered: %q", got)
+	}
+	if extra := mediaURLsFromToolOutput(json.RawMessage(`{"status":"completed"}`)); len(extra) != 0 {
+		t.Fatalf("non-media tool output should yield nothing: %v", extra)
+	}
 }

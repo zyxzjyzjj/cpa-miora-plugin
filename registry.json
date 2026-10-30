@@ -6,7 +6,7 @@
       "name": "Miora",
       "description": "通过反代 miora.design 的图像 / 视频 / 3D 生成能力接入 CPA，提供 OpenAI 兼容的 chat completions 媒体输出、浏览器登录态一键导入、token 自动轮换、额度视图与控制台。",
       "author": "zyxzjyzjj",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "repository": "https://github.com/zyxzjyzjj/cpa-miora-plugin",
       "homepage": "https://github.com/zyxzjyzjj/cpa-miora-plugin",
       "tags": [

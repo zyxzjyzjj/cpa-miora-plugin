@@ -7,6 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,16 +29,17 @@ import (
 // Media models stay on the REST media API; agent models never touch it.
 
 const (
-	pathWorkflowCreate   = "/api/ai/workflow/create"
-	pathWorkflowList     = "/api/ai/workflow/list"
-	pathAgentRuntimes    = "/api/ai/cloud-agent/runtimes"
-	pathAgentTiers       = "/api/ai/public/cloud-agent/tiers"
-	agentACPBootstrap    = "/bootstrap"
-	agentPromptID        = 4
-	agentSessionNewID    = 2
-	agentDefaultModelID  = "deepseek-v4.1-flash"
-	agentBypassMode      = "bypassPermissions"
-	agentSSEScanMaxBytes = 8 << 20
+	pathWorkflowCreate       = "/api/ai/workflow/create"
+	pathWorkflowList         = "/api/ai/workflow/list"
+	pathAgentRuntimes        = "/api/ai/cloud-agent/runtimes"
+	pathAgentTiers           = "/api/ai/public/cloud-agent/tiers"
+	pathToolConfirmationMode = "/api/ai/tool-confirmation/mode"
+	agentACPBootstrap        = "/bootstrap"
+	agentPromptID            = 4
+	agentSessionNewID        = 2
+	agentDefaultModelID      = "deepseek-v4.1-flash"
+	agentBypassMode          = "bypassPermissions"
+	agentSSEScanMaxBytes     = 8 << 20
 )
 
 // agentModel is one model the agent sandbox accepts in session/set_model.
@@ -58,7 +62,11 @@ type agentRuntime struct {
 	ACPToken     string
 	TokenExpires time.Time
 	Models       []agentModel
-	Created      time.Time
+	// SessionID is the sandbox's single ACP session. The sandbox manager enforces
+	// one session per runtime ("SingleSessionId"), so it is created once and reused;
+	// opening a second one makes session/new wait for a manifest that never arrives.
+	SessionID string
+	Created   time.Time
 }
 
 func (r *agentRuntime) usable(cfg *Config) bool {
@@ -302,6 +310,7 @@ func ensureAgentRuntime(ctx context.Context, cfg *Config, cred *credential) (*ag
 			continue
 		}
 		rememberProject(key, projectID)
+		enableAutoConfirmation(ctx, client, projectID)
 		storeAgentRuntime(cfg, cred, runtime)
 		logInfo("agent runtime ready", map[string]any{
 			"project": projectID, "runtime": runtime.RuntimeID, "models": len(runtime.Models),
@@ -318,11 +327,26 @@ func ensureAgentRuntime(ctx context.Context, cfg *Config, cred *credential) (*ag
 		return nil, errRuntime
 	}
 	rememberProject(key, projectID)
+	enableAutoConfirmation(ctx, client, projectID)
 	storeAgentRuntime(cfg, cred, runtime)
 	logInfo("agent runtime provisioned", map[string]any{
 		"project": projectID, "runtime": runtime.RuntimeID,
 	})
 	return runtime, nil
+}
+
+// enableAutoConfirmation flips the project's media-tool confirmation mode to
+// "auto". Without it every design tool call waits for a human approval that a
+// stateless proxy cannot give, and the turn stalls until the upstream timeout.
+func enableAutoConfirmation(ctx context.Context, client *apiClient, projectID string) {
+	payload := map[string]any{"projectId": projectID, "mode": "auto"}
+	if _, errPost := client.requestJSON(ctx, http.MethodPost, pathToolConfirmationMode, nil, payload, true); errPost != nil {
+		logWarn("could not enable auto tool confirmation", map[string]any{
+			"project": projectID, "error": errPost.Error(),
+		})
+		return
+	}
+	logInfo("auto tool confirmation enabled", map[string]any{"project": projectID})
 }
 
 // rememberedProjects maps an account to the project this process chose, so a
@@ -492,7 +516,7 @@ func (r *agentRuntime) closeAgentSession(cfg *Config, sessionID string) {
 		Initialize:   acpRequest{JSONRPC: "2.0", ID: 1, Method: "initialize"},
 		SessionClose: acpRequest{JSONRPC: "2.0", ID: 2, Method: "session/close", Params: acpSessionLoadParams{SessionID: sessionID}},
 	}
-	if errClose := r.bootstrap(ctx, cfg, batch, func(frame *acpFrame) bool {
+	if errClose := r.bootstrap(ctx, cfg, batch, 15*time.Second, func(frame *acpFrame) bool {
 		return frame.ID != nil && *frame.ID == 2
 	}); errClose != nil {
 		logWarn("agent session close failed", map[string]any{"error": errClose.Error()})
@@ -686,7 +710,11 @@ type acpFrame struct {
 	} `json:"error"`
 	Params struct {
 		Update struct {
-			SessionUpdate string `json:"sessionUpdate"`
+			SessionUpdate string          `json:"sessionUpdate"`
+			Status        string          `json:"status"`
+			Title         string          `json:"title"`
+			ToolName      string          `json:"toolName"`
+			RawOutput     json.RawMessage `json:"rawOutput"`
 			Content       struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
@@ -717,6 +745,31 @@ type agentSession struct {
 
 // startAgentSession opens a fresh ACP session on the runtime's sandbox.
 func (r *agentRuntime) startAgentSession(ctx context.Context, cfg *Config) (*agentSession, error) {
+	if existing := strings.TrimSpace(r.SessionID); existing != "" {
+		return &agentSession{SessionID: existing}, nil
+	}
+	// A freshly provisioned sandbox needs tens of seconds before its session
+	// manifest exists; the manager answers "no session available after 40s" until
+	// then, so retry instead of failing the user's request.
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		session, errSession := r.createAgentSession(ctx, cfg)
+		if errSession == nil {
+			return session, nil
+		}
+		lastErr = errSession
+		if !strings.Contains(errSession.Error(), "session") {
+			return nil, errSession
+		}
+		if errWait := sleepCtx(ctx, 20*time.Second); errWait != nil {
+			return nil, errWait
+		}
+	}
+	return nil, lastErr
+}
+
+// createAgentSession performs one session/new round trip.
+func (r *agentRuntime) createAgentSession(ctx context.Context, cfg *Config) (*agentSession, error) {
 	batch := struct {
 		Initialize acpRequest `json:"initialize"`
 		SessionNew acpRequest `json:"sessionNew"`
@@ -728,7 +781,7 @@ func (r *agentRuntime) startAgentSession(ctx context.Context, cfg *Config) (*age
 		}},
 	}
 	session := &agentSession{}
-	errStream := r.bootstrap(ctx, cfg, batch, func(frame *acpFrame) bool {
+	errStream := r.bootstrap(ctx, cfg, batch, 240*time.Second, func(frame *acpFrame) bool {
 		if frame.ID != nil && *frame.ID == agentSessionNewID {
 			var result struct {
 				SessionID string `json:"sessionId"`
@@ -759,8 +812,9 @@ func (r *agentRuntime) startAgentSession(ctx context.Context, cfg *Config) (*age
 		return nil, errStream
 	}
 	if session.SessionID == "" {
-		return nil, fmt.Errorf("Miora Agent 没有返回 sessionId")
+		return nil, fmt.Errorf("沙箱暂时没有可用会话（SingleSessionId 被占用），稍后重试")
 	}
+	r.SessionID = session.SessionID
 	if len(session.Models) > 0 {
 		r.Models = session.Models
 		agentRuntimes.mu.Lock()
@@ -771,7 +825,7 @@ func (r *agentRuntime) startAgentSession(ctx context.Context, cfg *Config) (*age
 }
 
 // prompt sends one user turn and streams the assistant text back.
-func (r *agentRuntime) prompt(ctx context.Context, cfg *Config, session *agentSession, modelID, text string, onDelta func(string) error) (*agentUsage, string, error) {
+func (r *agentRuntime) prompt(ctx context.Context, cfg *Config, session *agentSession, modelID, text string, onDelta func(string) error) (*agentUsage, string, []string, error) {
 	batch := struct {
 		Initialize  acpRequest `json:"initialize"`
 		SessionLoad acpRequest `json:"sessionLoad"`
@@ -795,15 +849,34 @@ func (r *agentRuntime) prompt(ctx context.Context, cfg *Config, session *agentSe
 	usage := &agentUsage{Model: modelID}
 	stopReason := ""
 	permissionDenied := false
-	errStream := r.bootstrap(ctx, cfg, batch, func(frame *acpFrame) bool {
+	updateCounts := map[string]int{}
+	artifacts := make([]string, 0, 2)
+	promptTimeout := 300 * time.Second
+	if cfg != nil && cfg.AgentTimeoutSeconds > 0 {
+		promptTimeout = time.Duration(cfg.AgentTimeoutSeconds) * time.Second
+	}
+	errStream := r.bootstrap(ctx, cfg, batch, promptTimeout, func(frame *acpFrame) bool {
 		switch {
 		case frame.Method == "session/update":
 			update := frame.Params.Update
+			updateCounts[update.SessionUpdate]++
 			switch update.SessionUpdate {
 			case "agent_message_chunk":
 				if update.Content.Text != "" && onDelta != nil {
 					if errDelta := onDelta(update.Content.Text); errDelta != nil {
 						return true
+					}
+				}
+			case "tool_call", "tool_call_update":
+				// Design tools (image / video / 3D) report completion here; when the
+				// payload carries artifact links they are forwarded to the caller.
+				if strings.EqualFold(update.Status, "completed") {
+					found := mediaURLsFromToolOutput(update.RawOutput)
+					if len(found) > 0 {
+						artifacts = append(artifacts, found...)
+						logInfo("agent tool produced artifacts: "+strconv.Itoa(len(found)), map[string]any{
+							"tool": firstNonEmpty(update.ToolName, update.Title),
+						})
 					}
 				}
 			case "usage_update":
@@ -851,18 +924,26 @@ func (r *agentRuntime) prompt(ctx context.Context, cfg *Config, session *agentSe
 		}
 		return false
 	})
+	if len(updateCounts) > 0 {
+		logInfo("agent updates: "+formatUpdateCounts(updateCounts), map[string]any{"model": modelID})
+	}
 	if errStream != nil {
-		return usage, stopReason, errStream
+		// The cached session may have been reclaimed by the sandbox: drop it so the
+		// caller's retry opens a fresh one.
+		if strings.Contains(errStream.Error(), "session") {
+			r.SessionID = ""
+		}
+		return usage, stopReason, artifacts, errStream
 	}
 	if permissionDenied && stopReason == "" {
-		return usage, stopReason, fmt.Errorf("该会话触发了工具调用审批：请把 agent_mode 设为 bypassPermissions，或改用网页端操作")
+		return usage, stopReason, artifacts, fmt.Errorf("该会话触发了工具调用审批：请把 agent_mode 设为 bypassPermissions，或改用网页端操作")
 	}
-	return usage, stopReason, nil
+	return usage, stopReason, artifacts, nil
 }
 
 // bootstrap posts one ACP batch and consumes the SSE stream until done() returns
 // true, the stream ends, or the context expires.
-func (r *agentRuntime) bootstrap(ctx context.Context, cfg *Config, batch any, done func(*acpFrame) bool) error {
+func (r *agentRuntime) bootstrap(ctx context.Context, cfg *Config, batch any, timeout time.Duration, done func(*acpFrame) bool) error {
 	payload, errMarshal := json.Marshal(batch)
 	if errMarshal != nil {
 		return errMarshal
@@ -873,11 +954,10 @@ func (r *agentRuntime) bootstrap(ctx context.Context, cfg *Config, batch any, do
 	headers.Set("Accept", "text/event-stream")
 	headers.Set("User-Agent", defaultUserAgent)
 
-	timeout := 180 * time.Second
-	if cfg != nil && cfg.AgentTimeoutSeconds > 0 {
-		timeout = time.Duration(cfg.AgentTimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 180 * time.Second
 	}
-	streamCtx, cancel := context.WithCancel(ctx)
+	streamCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	type openResult struct {
@@ -920,12 +1000,6 @@ func (r *agentRuntime) bootstrap(ctx context.Context, cfg *Config, batch any, do
 		body, _ := readAllLimited(resp.Body, 4096)
 		return &upstreamError{Status: resp.StatusCode, Message: "ACP bootstrap 失败：" + upstreamSnippet(body)}
 	}
-
-	deadline, hasDeadline := ctx.Deadline()
-	if !hasDeadline {
-		deadline = time.Now().Add(timeout)
-	}
-	_ = deadline
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64<<10), agentSSEScanMaxBytes)
@@ -979,4 +1053,81 @@ func encodeQuery(values map[string]string) string {
 		parts = append(parts, key+"="+value)
 	}
 	return strings.Join(parts, "&")
+}
+
+// formatUpdateCounts renders the ACP update histogram for the host log, e.g.
+// "session_info_update=4,agent_message_chunk=33,tool_call=2".
+func formatUpdateCounts(counts map[string]int) string {
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", key, counts[key]))
+	}
+	return strings.Join(parts, ",")
+}
+
+// mediaURLsFromToolOutput pulls artifact links out of a completed tool result.
+// Miora's design tools answer with a JSON envelope that is sometimes nested twice,
+// so the payload is unwrapped first and then scanned for signed asset URLs.
+var (
+	toolURLPattern  = regexp.MustCompile(`https://sign\.miorausercontent\.com/[^"\s\\]+`)
+	toolFilePattern = regexp.MustCompile(`"file_key"\s*:\s*"([^"]+)"`)
+)
+
+// unwrapToolOutput flattens {"text":"[{...}]"} into the innermost JSON text.
+func unwrapToolOutput(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var envelope struct {
+		Text string `json:"text"`
+		Type string `json:"type"`
+	}
+	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal == nil && envelope.Text != "" {
+		var blocks []struct {
+			Text string `json:"text"`
+		}
+		if errBlocks := json.Unmarshal([]byte(envelope.Text), &blocks); errBlocks == nil && len(blocks) > 0 {
+			return blocks[0].Text
+		}
+		return envelope.Text
+	}
+	return string(raw)
+}
+
+func mediaURLsFromToolOutput(raw json.RawMessage) []string {
+	text := unwrapToolOutput(raw)
+	if text == "" {
+		return nil
+	}
+	found := make([]string, 0, 2)
+	seen := map[string]struct{}{}
+	for _, match := range toolURLPattern.FindAllString(text, 4) {
+		if _, ok := seen[match]; ok {
+			continue
+		}
+		seen[match] = struct{}{}
+		found = append(found, match)
+	}
+	return found
+}
+
+// toolFileKeys exposes file keys from a tool result for callers that prefer
+// re-signing over a short-lived URL.
+func toolFileKeys(raw json.RawMessage) []string {
+	text := unwrapToolOutput(raw)
+	if text == "" {
+		return nil
+	}
+	keys := make([]string, 0, 2)
+	for _, match := range toolFilePattern.FindAllStringSubmatch(text, 4) {
+		if len(match) > 1 {
+			keys = append(keys, match[1])
+		}
+	}
+	return keys
 }

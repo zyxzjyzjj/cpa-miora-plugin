@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,7 +34,6 @@ func runAgentTurn(ctx context.Context, cfg *Config, plan *executionPlan, onDelta
 	if errSession != nil {
 		return "", nil, errSession
 	}
-	defer func() { go runtime.closeAgentSession(cfg, session.SessionID) }()
 
 	modelID := strings.TrimSpace(plan.model)
 	if modelID == "" {
@@ -42,13 +42,21 @@ func runAgentTurn(ctx context.Context, cfg *Config, plan *executionPlan, onDelta
 	prompt := buildAgentPrompt(plan.parsed)
 
 	var builder strings.Builder
-	usage, _, errPrompt := runtime.prompt(ctx, cfg, session, modelID, prompt, func(delta string) error {
+	streamDeltas := func(delta string) error {
 		builder.WriteString(delta)
 		if onDelta != nil {
 			return onDelta(delta)
 		}
 		return nil
-	})
+	}
+	usage, _, artifacts, errPrompt := runtime.prompt(ctx, cfg, session, modelID, prompt, streamDeltas)
+	if errPrompt != nil && strings.TrimSpace(runtime.SessionID) == "" {
+		// The sandbox reclaimed the session; open a fresh one and retry once.
+		if retrySession, errRetry := runtime.startAgentSession(ctx, cfg); errRetry == nil {
+			builder.Reset()
+			usage, _, artifacts, errPrompt = runtime.prompt(ctx, cfg, retrySession, modelID, prompt, streamDeltas)
+		}
+	}
 	if errPrompt != nil {
 		if authErr := asAuthError(errPrompt); authErr != nil {
 			return "", usage, authErr
@@ -56,10 +64,36 @@ func runAgentTurn(ctx context.Context, cfg *Config, plan *executionPlan, onDelta
 		return builder.String(), usage, errPrompt
 	}
 	text := builder.String()
+	logInfo("agent turn artifacts: "+strconv.Itoa(len(artifacts)), map[string]any{"model": plan.model})
+	// Design tools (image / video / 3D) return artifacts out of band; surface them
+	// so a chat client actually sees what the agent produced.
+	if markdown := artifactMarkdown(artifacts); markdown != "" {
+		if onDelta != nil {
+			_ = onDelta(markdown)
+		}
+		text += markdown
+	}
 	if strings.TrimSpace(text) == "" {
 		return "", usage, fmt.Errorf("Miora Agent 没有返回文本内容（stopReason 可能是工具调用）")
 	}
 	return text, usage, nil
+}
+
+// artifactMarkdown renders tool artifacts as Markdown so chat clients can show them.
+func artifactMarkdown(urls []string) string {
+	if len(urls) == 0 {
+		return ""
+	}
+	var builder strings.Builder
+	builder.WriteString("\n\n")
+	for index, url := range urls {
+		if index > 0 {
+			builder.WriteString("\n")
+		}
+		builder.WriteString("![Miora 生成](" + url + ")\n")
+		builder.WriteString("> " + url)
+	}
+	return builder.String()
 }
 
 // openAgentSession provisions/reuses a sandbox and opens one session. A cold or
