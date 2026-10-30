@@ -86,6 +86,7 @@ func fakeACP(t *testing.T) *httptest.Server {
 		writeFrame(`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"你好"}}}}`)
 		writeFrame(`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"，世界"}}}}`)
 		writeFrame(`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"usage_update","inputTokens":123,"outputTokens":7,"model":"deepseek-v4.1-flash"}}}`)
+		writeFrame(`{"jsonrpc":"2.0","method":"_codebuddy.ai/artifact","params":{"event":"created","artifact":{"uri":"https://sign.miorausercontent.com/a.png?sign=x","type":"image"}}}`)
 		writeFrame(`{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn","usage":{"inputTokens":123,"outputTokens":9,"model":"deepseek-v4.1-flash"}}}`)
 	})
 	return httptest.NewServer(mux)
@@ -132,8 +133,8 @@ func TestAgentRuntimeSessionAndPrompt(t *testing.T) {
 	if usage == nil || usage.InputTokens != 123 || usage.OutputTokens != 9 {
 		t.Fatalf("usage not parsed from the result frame: %+v", usage)
 	}
-	if len(artifacts) != 0 {
-		t.Fatalf("no tool artifacts expected in a plain text turn: %v", artifacts)
+	if len(artifacts) != 1 || !strings.HasPrefix(artifacts[0], "https://sign.miorausercontent.com/") {
+		t.Fatalf("artifact notification not surfaced: %v", artifacts)
 	}
 }
 

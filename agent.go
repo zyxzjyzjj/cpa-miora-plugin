@@ -709,6 +709,15 @@ type acpFrame struct {
 		Message string `json:"message"`
 	} `json:"error"`
 	Params struct {
+		// Artifact notifications (_codebuddy.ai/artifact) carry their payload at the
+		// params level, next to `update` for session/update notifications.
+		Event    string `json:"event"`
+		Artifact struct {
+			URI   string `json:"uri"`
+			Type  string `json:"type"`
+			Title string `json:"title"`
+			Text  string `json:"text"`
+		} `json:"artifact"`
 		Update struct {
 			SessionUpdate string          `json:"sessionUpdate"`
 			Status        string          `json:"status"`
@@ -888,6 +897,19 @@ func (r *agentRuntime) prompt(ctx context.Context, cfg *Config, session *agentSe
 				}
 				if update.CachedReadTokens > 0 {
 					usage.CachedReadTokens = update.CachedReadTokens
+				}
+			}
+		case frame.Method == "_codebuddy.ai/artifact":
+			// Design tools publish their results here (uri + type), not through
+			// tool_call_update. Without this the reply says "image generated" but the
+			// client never receives a link.
+			artifact := frame.Params.Artifact
+			if frame.Params.Event != "deleted" {
+				for _, url := range artifactURLs(artifact.URI, artifact.Text) {
+					artifacts = append(artifacts, url)
+				}
+				if artifact.URI != "" {
+					logInfo("agent artifact: "+artifact.Type, map[string]any{"uri": truncateRunes(artifact.URI, 120)})
 				}
 			}
 		case frame.Method == "session/request_permission":
@@ -1130,4 +1152,30 @@ func toolFileKeys(raw json.RawMessage) []string {
 		}
 	}
 	return keys
+}
+
+// artifactURLs normalises an artifact notification into displayable links. The
+// uri is usually the signed asset URL; when it is a bare file key the text field
+// or a signed URL pattern inside the payload supplies the link.
+func artifactURLs(uri, text string) []string {
+	out := make([]string, 0, 2)
+	seen := map[string]struct{}{}
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	if strings.HasPrefix(uri, "https://") || strings.HasPrefix(uri, "http://") {
+		add(uri)
+	}
+	for _, match := range toolURLPattern.FindAllString(text, 4) {
+		add(match)
+	}
+	return out
 }
