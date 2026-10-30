@@ -164,7 +164,7 @@ func defaultConfig() *Config {
 		AgentTimeoutSeconds:    420,
 		AgentRuntimeTTLMinutes: 120,
 		AgentContextLength:     1000000,
-		AgentMaxPromptTokens:   150000,
+		AgentMaxPromptTokens:   600000,
 		UseHostHTTP:            false,
 		EnableBrowserImport:    true,
 		ResponseFooter:         true,
@@ -238,7 +238,7 @@ func (c *Config) normalize() {
 		c.AgentContextLength = 1000000
 	}
 	if c.AgentMaxPromptTokens <= 0 {
-		c.AgentMaxPromptTokens = 150000
+		c.AgentMaxPromptTokens = 600000
 	}
 	c.AgentModels = normalizeIDList(c.AgentModels)
 	c.IncludeModels = normalizeIDList(c.IncludeModels)
@@ -421,10 +421,10 @@ func (c *Config) validate() error {
 // effectiveMaxPromptTokens returns the project memory budget in tokens.
 func (c *Config) effectiveMaxPromptTokens() int {
 	if c == nil {
-		return 150000
+		return 600000
 	}
 	if c.AgentMaxPromptTokens > 0 {
 		return c.AgentMaxPromptTokens
 	}
-	return 150000
+	return 600000
 }

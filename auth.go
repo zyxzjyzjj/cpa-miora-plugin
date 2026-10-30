@@ -732,6 +732,7 @@ func startBackground(cfg *Config) {
 				return
 			case <-first.C:
 				refreshDueCredentials(ctx, config())
+				prewarmAgentRuntimes(ctx, config())
 			case <-ticker.C:
 				refreshDueCredentials(ctx, config())
 			}
@@ -762,6 +763,48 @@ var background struct {
 // refreshDueCredentials walks the host auth records of this provider and rotates
 // the ones close to expiry. Persisting through host.auth.save is mandatory:
 // Miora rotates refresh tokens, so an unsaved rotation locks the account out.
+// prewarmAgentRuntimes provisions each account's sandbox in the background so the
+// first user request does not pay the cold start (measured 20s vs 3s warm).
+func prewarmAgentRuntimes(ctx context.Context, cfg *Config) {
+	if cfg == nil || !cfg.AgentEnabled {
+		return
+	}
+	raw, errList := hostCall(pluginabi.MethodHostAuthList, map[string]any{})
+	if errList != nil {
+		return
+	}
+	var list struct {
+		Files []pluginapi.HostAuthFileEntry `json:"Files"`
+	}
+	if errUnmarshal := json.Unmarshal(raw, &list); errUnmarshal != nil {
+		return
+	}
+	for _, entry := range list.Files {
+		if ctx.Err() != nil {
+			return
+		}
+		if !strings.EqualFold(entry.Provider, providerID) && !strings.EqualFold(entry.Type, providerID) {
+			continue
+		}
+		index := strings.TrimSpace(entry.AuthIndex)
+		if index == "" {
+			continue
+		}
+		cred, _, errCred := loadAccountCredential(entry)
+		if errCred != nil || cred == nil {
+			continue
+		}
+		warmCtx, cancel := context.WithTimeout(ctx, 150*time.Second)
+		runtime, errWarm := ensureAgentRuntime(warmCtx, cfg, cred)
+		cancel()
+		if errWarm != nil {
+			logWarn("agent prewarm failed", map[string]any{"account": index, "error": errWarm.Error()})
+			continue
+		}
+		logInfo("agent prewarmed", map[string]any{"account": index, "runtime": runtime.RuntimeID})
+	}
+}
+
 func refreshDueCredentials(ctx context.Context, cfg *Config) {
 	raw, errList := hostCall(pluginabi.MethodHostAuthList, map[string]any{})
 	if errList != nil {
