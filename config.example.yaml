@@ -1,0 +1,62 @@
+# miora-provider — CLIProxyAPI 插件示例配置
+#
+# 完整说明见 README.md。
+# 这段配置粘贴到 CPA 的 config.yaml，重启后生效。
+
+plugins:
+  enabled: true
+  dir: "plugins"
+  configs:
+    miora-provider:
+      enabled: true
+      priority: 1
+
+      # 上游站点。海外站是 https://miora.design。
+      base_url: "https://miora.design"
+      language: "zh-CN"
+
+      # 对外模型 ID 前缀。留空则直接用上游模型名（gem-3.1、vidu-q2-pro-video…）。
+      model_prefix: ""
+
+      # 只暴露这些上游模型；留空表示全部（免费档 42 个）。
+      # include_models: ["hy-image-3.5-f", "gem-3.1", "tripo-3d-3.1"]
+      exclude_models: []
+
+      # 离线场景下的静态模型表，目录接口拉不到时仍能注册模型。
+      # models:
+      #   - { id: "gem-3.1", upstream: "gem-3.1", media: "image", label: "Gem 3.1" }
+      #   - { id: "tripo", upstream: "tripo-3d-3.1", media: "three_d", label: "Tripo 3D" }
+
+      # miora-auto 与未知模型的兜底目标。
+      default_image_model: ""
+      default_video_model: ""
+      default_3d_model: ""
+      default_video_seconds: 5
+
+      # 生成节奏。视频 / 3D 建议把超时放大到 600 以上。
+      poll_interval_seconds: 4
+      task_timeout_seconds: 420
+      max_concurrent_tasks: 4
+
+      # 余额低于该值直接拒绝；0 关闭（免费档 /quota/credit 常返回 0）。
+      reserve_credits: 0
+
+      # 实验特性：允许把 data:/http(s) 参考图上传到 Miora 的 COS。
+      # 关闭时请改用 miora://file/... 形式的已有文件。
+      upload_reference_images: false
+
+      # 面板「扫描本机浏览器」开关与限定 profile。
+      enable_browser_import: true
+      browser_profiles: []
+
+      include_watermark: false
+      response_footer: true
+
+      catalog_ttl_minutes: 30
+      auto_refresh_hours: 24
+      event_log_size: 200
+
+      # 上游传输。direct:// 强制直连；use_host_http=false 完全绕开宿主桥。
+      proxy_url: ""
+      use_host_http: true
+      request_timeout_seconds: 60

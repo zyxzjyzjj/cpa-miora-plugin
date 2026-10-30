@@ -1,0 +1,21 @@
+# Local test fixtures and reference checkouts (never part of the deliverable)
+_refs/
+_e2e/
+
+# Build products
+plugins/
+release-assets/
+*.dll
+*.so
+*.dylib
+*.h
+
+# Go
+*.test
+*.out
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

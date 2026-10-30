@@ -1,0 +1,13 @@
+# Normalise line endings so Windows checkouts do not rewrite the whole tree.
+* text=auto eol=lf
+
+# Batch files must keep CRLF to run correctly.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binaries and archives
+*.dll binary
+*.so binary
+*.dylib binary
+*.zip binary
+*.png binary

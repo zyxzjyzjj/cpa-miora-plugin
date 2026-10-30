@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "miora-provider",
+      "name": "Miora",
+      "description": "Miora image/video/3D generation as OpenAI-compatible models, with one-click browser session import, token rotation, quota view and a dashboard.",
+      "author": "cpa-miora-plugin",
+      "version": "0.1.0",
+      "repository": "https://github.com/zjj/cpa-miora-plugin",
+      "homepage": "https://miora.design",
+      "license": "MIT",
+      "tags": [
+        "provider",
+        "auth",
+        "image",
+        "video",
+        "3d",
+        "quota",
+        "management"
+      ]
+    }
+  ]
+}
