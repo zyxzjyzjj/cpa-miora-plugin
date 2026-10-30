@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -66,7 +67,9 @@ type agentRuntime struct {
 	// one session per runtime ("SingleSessionId"), so it is created once and reused;
 	// opening a second one makes session/new wait for a manifest that never arrives.
 	SessionID string
-	Created   time.Time
+	// StateKey identifies the account in the persisted state file.
+	StateKey string
+	Created  time.Time
 }
 
 func (r *agentRuntime) usable(cfg *Config) bool {
@@ -201,7 +204,7 @@ func loadAgentTiers(ctx context.Context, cfg *Config) []agentModel {
 	}
 
 	client := newAPIClient(cfg, nil)
-	data, errFetch := client.requestJSON(ctx, http.MethodGet, pathAgentTiers, nil, nil, false)
+	data, errFetch := client.agentJSON(ctx, http.MethodGet, pathAgentTiers, nil, nil)
 	if errFetch != nil {
 		logWarn("agent tier catalogue unavailable", map[string]any{"error": errFetch.Error()})
 		return models
@@ -293,6 +296,20 @@ func ensureAgentRuntime(ctx context.Context, cfg *Config, cred *credential) (*ag
 	}
 
 	client := newAPIClient(cfg, cred)
+	if entry, ok := stateEntry(key); ok && entry.RuntimeID != "" {
+		if runtime, errEntry := runtimeByID(ctx, client, cfg, entry.ProjectID, entry.RuntimeID); errEntry == nil {
+			runtime.SessionID = entry.SessionID
+			runtime.StateKey = key
+			rememberProject(key, entry.ProjectID)
+			storeAgentRuntime(cfg, cred, runtime)
+			logInfo("agent runtime restored", map[string]any{
+				"project": entry.ProjectID, "runtime": entry.RuntimeID,
+			})
+			return runtime, nil
+		}
+		forgetState(key)
+	}
+
 	candidates := make([]string, 0, 4)
 	if cfg.AgentProjectID != "" {
 		candidates = append(candidates, cfg.AgentProjectID)
@@ -311,6 +328,8 @@ func ensureAgentRuntime(ctx context.Context, cfg *Config, cred *credential) (*ag
 		}
 		rememberProject(key, projectID)
 		enableAutoConfirmation(ctx, client, projectID)
+		runtime.StateKey = key
+		rememberState(key, projectID, runtime.RuntimeID, runtime.SessionID)
 		storeAgentRuntime(cfg, cred, runtime)
 		logInfo("agent runtime ready", map[string]any{
 			"project": projectID, "runtime": runtime.RuntimeID, "models": len(runtime.Models),
@@ -328,6 +347,8 @@ func ensureAgentRuntime(ctx context.Context, cfg *Config, cred *credential) (*ag
 	}
 	rememberProject(key, projectID)
 	enableAutoConfirmation(ctx, client, projectID)
+	runtime.StateKey = key
+	rememberState(key, projectID, runtime.RuntimeID, runtime.SessionID)
 	storeAgentRuntime(cfg, cred, runtime)
 	logInfo("agent runtime provisioned", map[string]any{
 		"project": projectID, "runtime": runtime.RuntimeID,
@@ -335,12 +356,18 @@ func ensureAgentRuntime(ctx context.Context, cfg *Config, cred *credential) (*ag
 	return runtime, nil
 }
 
+// agentJSON performs one provisioning call straight to Miora, bypassing the host
+// HTTP bridge: a hung bridge callback would eat the whole agent request timeout.
+func (c *apiClient) agentJSON(ctx context.Context, method, path string, query url.Values, payload any) (json.RawMessage, error) {
+	return c.requestJSONDirect(ctx, method, path, query, payload, true, 25*time.Second)
+}
+
 // enableAutoConfirmation flips the project's media-tool confirmation mode to
 // "auto". Without it every design tool call waits for a human approval that a
 // stateless proxy cannot give, and the turn stalls until the upstream timeout.
 func enableAutoConfirmation(ctx context.Context, client *apiClient, projectID string) {
 	payload := map[string]any{"projectId": projectID, "mode": "auto"}
-	if _, errPost := client.requestJSON(ctx, http.MethodPost, pathToolConfirmationMode, nil, payload, true); errPost != nil {
+	if _, errPost := client.agentJSON(ctx, http.MethodPost, pathToolConfirmationMode, nil, payload); errPost != nil {
 		logWarn("could not enable auto tool confirmation", map[string]any{
 			"project": projectID, "error": errPost.Error(),
 		})
@@ -358,14 +385,25 @@ var rememberedProjects = struct {
 
 func rememberProject(key, projectID string) {
 	rememberedProjects.mu.Lock()
-	defer rememberedProjects.mu.Unlock()
 	rememberedProjects.byKey[key] = projectID
+	rememberedProjects.mu.Unlock()
+	if entry, ok := stateEntry(key); ok && entry.ProjectID == projectID {
+		return
+	}
+	rememberState(key, projectID, "", "")
 }
 
 func rememberedProject(key string) string {
 	rememberedProjects.mu.Lock()
-	defer rememberedProjects.mu.Unlock()
-	return rememberedProjects.byKey[key]
+	existing := rememberedProjects.byKey[key]
+	rememberedProjects.mu.Unlock()
+	if existing != "" {
+		return existing
+	}
+	if entry, ok := stateEntry(key); ok {
+		return entry.ProjectID
+	}
+	return ""
 }
 
 // findAgentProjects lists projects whose title starts with the configured prefix,
@@ -379,7 +417,7 @@ func findAgentProjects(ctx context.Context, client *apiClient, cfg *Config) ([]s
 	headers := client.webHeaders(false)
 	timeoutCtx, cancel := context.WithTimeout(ctx, cfg.requestTimeout())
 	defer cancel()
-	result, errDo := doUpstream(timeoutCtx, cfg, http.MethodGet, target, headers, nil)
+	result, errDo := doUpstreamDirect(timeoutCtx, cfg, http.MethodGet, target, headers, nil)
 	if errDo != nil {
 		return nil, errDo
 	}
@@ -414,7 +452,7 @@ func findAgentProject(ctx context.Context, client *apiClient, cfg *Config) (stri
 	headers := client.webHeaders(false)
 	timeoutCtx, cancel := context.WithTimeout(ctx, cfg.requestTimeout())
 	defer cancel()
-	result, errDo := doUpstream(timeoutCtx, cfg, http.MethodGet, target, headers, nil)
+	result, errDo := doUpstreamDirect(timeoutCtx, cfg, http.MethodGet, target, headers, nil)
 	if errDo != nil {
 		return "", errDo
 	}
@@ -447,7 +485,7 @@ func createAgentProject(ctx context.Context, client *apiClient, cfg *Config) (st
 	if existing, errExisting := findAgentProjects(ctx, client, cfg); errExisting == nil && len(existing) > 0 {
 		title = title + " " + randomHex(3)
 	}
-	data, errPost := client.requestJSON(ctx, http.MethodPost, pathWorkflowCreate, nil, map[string]any{"title": title}, true)
+	data, errPost := client.agentJSON(ctx, http.MethodPost, pathWorkflowCreate, nil, map[string]any{"title": title})
 	if errPost != nil {
 		return "", fmt.Errorf("创建 Miora 项目失败：%w", errPost)
 	}
@@ -469,7 +507,7 @@ func createAgentProject(ctx context.Context, client *apiClient, cfg *Config) (st
 // rotates it, and a stale link is rejected as 401 by the sandbox.
 func refreshRuntimeLinks(ctx context.Context, cfg *Config, cred *credential, runtime *agentRuntime) (*agentRuntime, error) {
 	client := newAPIClient(cfg, cred)
-	data, errGet := client.requestJSON(ctx, http.MethodGet, pathAgentRuntimes+"/"+runtime.RuntimeID, nil, nil, true)
+	data, errGet := client.agentJSON(ctx, http.MethodGet, pathAgentRuntimes+"/"+runtime.RuntimeID, nil, nil)
 	if errGet != nil {
 		return nil, errGet
 	}
@@ -534,7 +572,7 @@ func runtimeForProject(ctx context.Context, client *apiClient, cfg *Config, proj
 
 // existingRuntimeForProject resolves project -> runtimeId -> ACP links.
 func existingRuntimeForProject(ctx context.Context, client *apiClient, cfg *Config, projectID string) (*agentRuntime, error) {
-	data, errGet := client.requestJSON(ctx, http.MethodGet, pathAgentRuntimes+"/by-project/"+projectID, nil, nil, true)
+	data, errGet := client.agentJSON(ctx, http.MethodGet, pathAgentRuntimes+"/by-project/"+projectID, nil, nil)
 	if errGet != nil {
 		return nil, errGet
 	}
@@ -549,7 +587,7 @@ func existingRuntimeForProject(ctx context.Context, client *apiClient, cfg *Conf
 
 // runtimeByID reads one runtime's links.
 func runtimeByID(ctx context.Context, client *apiClient, cfg *Config, projectID, runtimeID string) (*agentRuntime, error) {
-	data, errGet := client.requestJSON(ctx, http.MethodGet, pathAgentRuntimes+"/"+runtimeID, nil, nil, true)
+	data, errGet := client.agentJSON(ctx, http.MethodGet, pathAgentRuntimes+"/"+runtimeID, nil, nil)
 	if errGet != nil {
 		return nil, errGet
 	}
@@ -585,7 +623,7 @@ func runtimeByID(ctx context.Context, client *apiClient, cfg *Config, projectID,
 
 // projectRuntimeID returns the runtime id currently bound to a project.
 func projectRuntimeID(ctx context.Context, client *apiClient, projectID string) (string, error) {
-	data, errGet := client.requestJSON(ctx, http.MethodGet, pathAgentRuntimes+"/by-project/"+projectID, nil, nil, true)
+	data, errGet := client.agentJSON(ctx, http.MethodGet, pathAgentRuntimes+"/by-project/"+projectID, nil, nil)
 	if errGet != nil {
 		return "", errGet
 	}
@@ -601,7 +639,7 @@ func projectRuntimeID(ctx context.Context, client *apiClient, projectID string) 
 // deleteRuntime removes a runtime record so a wedged sandbox does not block the
 // project forever.
 func deleteRuntime(ctx context.Context, client *apiClient, runtimeID string) error {
-	_, errPost := client.requestJSON(ctx, http.MethodPost, pathAgentRuntimes+"/"+runtimeID+"/delete", nil, map[string]any{}, true)
+	_, errPost := client.agentJSON(ctx, http.MethodPost, pathAgentRuntimes+"/"+runtimeID+"/delete", nil, map[string]any{})
 	return errPost
 }
 
@@ -610,9 +648,9 @@ func createRuntimeForProject(ctx context.Context, client *apiClient, cfg *Config
 }
 
 func createRuntimeForProjectAttempt(ctx context.Context, client *apiClient, cfg *Config, projectID string, mayReplace bool) (*agentRuntime, error) {
-	data, errPost := client.requestJSON(ctx, http.MethodPost, pathAgentRuntimes, nil, map[string]any{
+	data, errPost := client.agentJSON(ctx, http.MethodPost, pathAgentRuntimes, nil, map[string]any{
 		"projectId": projectID,
-	}, true)
+	})
 	if errPost != nil {
 		if strings.Contains(errPost.Error(), "RUNTIME_ALREADY_EXISTS") {
 			// The project already owns a runtime (often one the web app created):
@@ -761,7 +799,7 @@ func (r *agentRuntime) startAgentSession(ctx context.Context, cfg *Config) (*age
 	// manifest exists; the manager answers "no session available after 40s" until
 	// then, so retry instead of failing the user's request.
 	var lastErr error
-	for attempt := 0; attempt < 4; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		session, errSession := r.createAgentSession(ctx, cfg)
 		if errSession == nil {
 			return session, nil
@@ -770,7 +808,7 @@ func (r *agentRuntime) startAgentSession(ctx context.Context, cfg *Config) (*age
 		if !strings.Contains(errSession.Error(), "session") {
 			return nil, errSession
 		}
-		if errWait := sleepCtx(ctx, 20*time.Second); errWait != nil {
+		if errWait := sleepCtx(ctx, 15*time.Second); errWait != nil {
 			return nil, errWait
 		}
 	}
@@ -790,7 +828,7 @@ func (r *agentRuntime) createAgentSession(ctx context.Context, cfg *Config) (*ag
 		}},
 	}
 	session := &agentSession{}
-	errStream := r.bootstrap(ctx, cfg, batch, 240*time.Second, func(frame *acpFrame) bool {
+	errStream := r.bootstrap(ctx, cfg, batch, 120*time.Second, func(frame *acpFrame) bool {
 		if frame.ID != nil && *frame.ID == agentSessionNewID {
 			var result struct {
 				SessionID string `json:"sessionId"`
@@ -824,6 +862,9 @@ func (r *agentRuntime) createAgentSession(ctx context.Context, cfg *Config) (*ag
 		return nil, fmt.Errorf("沙箱暂时没有可用会话（SingleSessionId 被占用），稍后重试")
 	}
 	r.SessionID = session.SessionID
+	if r.StateKey != "" {
+		rememberState(r.StateKey, r.ProjectID, r.RuntimeID, r.SessionID)
+	}
 	if len(session.Models) > 0 {
 		r.Models = session.Models
 		agentRuntimes.mu.Lock()
@@ -998,7 +1039,9 @@ func (r *agentRuntime) bootstrap(ctx context.Context, cfg *Config, batch any, ti
 				req.Header.Add(key, value)
 			}
 		}
-		client := &http.Client{} // streaming: no overall timeout, the context governs
+		// Streaming: no overall timeout (the context governs), but reuse the v4-first
+		// transport so a broken IPv6 route cannot stall the SSE handshake.
+		client := &http.Client{Transport: directTransport(proxySettingOf(cfg))}
 		resp, errDo := client.Do(req)
 		opened <- openResult{resp: resp, err: errDo}
 	}()

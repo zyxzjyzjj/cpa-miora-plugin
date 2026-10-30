@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -106,6 +107,14 @@ func openAgentSession(ctx context.Context, cfg *Config, cred *credential) (*agen
 			return runtime, session, nil
 		} else {
 			logWarn("agent session failed, provisioning a fresh runtime", map[string]any{"error": errSession.Error()})
+			// A runtime that cannot hand out a session is dead for good: drop it from
+			// both the memory cache and the state file, otherwise the next attempt
+			// restores the same wedged sandbox.
+			key := agentAccountKey(cfg, cred)
+			forgetState(key)
+			if client := newAPIClient(cfg, cred); client != nil && runtime.RuntimeID != "" {
+				_ = deleteRuntime(ctx, client, runtime.RuntimeID)
+			}
 		}
 	}
 	forgetAgentRuntime(cfg, cred)
@@ -143,23 +152,67 @@ func executorAgentStream(ctx context.Context, cfg *Config, req *executorRequest,
 		return nil, fmt.Errorf("emit role chunk: %w", errEmit)
 	}
 
-	// Host callbacks are synchronous, so emitting inside the SSE read loop would
-	// throttle the agent stream: hand deltas to a pump goroutine that coalesces
-	// them and keeps the read loop free.
-	emitter := newDeltaEmitter(streamID, stream)
-	text, usage, errAgent := runAgentTurn(ctx, cfg, plan, func(delta string) error {
-		emitter.push(delta)
-		return nil
-	})
-	emitter.finish(stream.chunkFinalUsage("stop", usage))
-	if errAgent != nil {
-		emitStreamError(streamID, errAgent.Error())
-		closeStream(streamID)
-		return okEnvelope(map[string]any{"headers": streamHeaders()})
-	}
-	closeStream(streamID)
-	logInfo("agent stream served", map[string]any{"model": plan.model, "chars": len(text)})
+	// The host only drains the stream bridge after executor.execute_stream returns
+	// (see pluginhost/rpc_client_stream.go: async plugins answer first, then keep
+	// emitting). A three-minute sandbox boot must therefore happen in the
+	// background, otherwise the client sits in silence until the turn is over.
+	_ = hostStreamEmit(streamID, stream.chunkContent("Miora Agent 已接单，正在准备沙箱…\n"))
+
+	turnCtx, cancel := context.WithTimeout(context.Background(), agentTurnTimeout(cfg))
+	go func() {
+		defer cancel()
+		defer closeStream(streamID)
+
+		emitter := newDeltaEmitter(streamID, stream)
+		firstDelta := make(chan struct{})
+		var once sync.Once
+		markFirst := func() { once.Do(func() { close(firstDelta) }) }
+		go agentWaitHeartbeat(turnCtx, streamID, stream, firstDelta)
+
+		text, usage, errAgent := runAgentTurn(turnCtx, cfg, plan, func(delta string) error {
+			markFirst()
+			emitter.push(delta)
+			return nil
+		})
+		markFirst()
+		if errAgent != nil {
+			emitter.finish(nil)
+			emitStreamError(streamID, errAgent.Error())
+			logWarn("agent stream failed", map[string]any{"model": plan.model, "error": errAgent.Error()})
+			return
+		}
+		emitter.finish(stream.chunkFinalUsage("stop", usage))
+		logInfo("agent stream served", map[string]any{"model": plan.model, "chars": len(text)})
+	}()
 	return okEnvelope(map[string]any{"headers": streamHeaders()})
+}
+
+// agentTurnTimeout bounds one detached agent turn so a wedged sandbox releases the
+// per-account lock instead of blocking every later request.
+func agentTurnTimeout(cfg *Config) time.Duration {
+	if cfg != nil && cfg.AgentTimeoutSeconds > 0 {
+		return time.Duration(cfg.AgentTimeoutSeconds) * time.Second
+	}
+	return 300 * time.Second
+}
+
+// agentWaitHeartbeat keeps the client informed while the sandbox boots: no token
+// can arrive before the ACP session exists, and some clients time out in silence.
+func agentWaitHeartbeat(ctx context.Context, streamID string, stream completionStream, firstDelta <-chan struct{}) {
+	ticker := time.NewTicker(20 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-firstDelta:
+			return
+		case <-ticker.C:
+			if errEmit := hostStreamEmit(streamID, stream.chunkContent("…仍在等待 Miora Agent（沙箱准备较慢）\n")); errEmit != nil {
+				return
+			}
+		}
+	}
 }
 
 // buildAgentPrompt renders a client transcript into one ACP prompt string.

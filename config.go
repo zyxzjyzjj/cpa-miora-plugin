@@ -149,7 +149,7 @@ func defaultConfig() *Config {
 		AgentDefaultModel:      agentDefaultModelID,
 		AgentProjectTitle:      "CPA 会话",
 		AgentMode:              agentBypassMode,
-		AgentTimeoutSeconds:    180,
+		AgentTimeoutSeconds:    420,
 		AgentRuntimeTTLMinutes: 120,
 		UseHostHTTP:            true,
 		EnableBrowserImport:    true,
@@ -215,7 +215,7 @@ func (c *Config) normalize() {
 		c.AgentMode = agentBypassMode
 	}
 	if c.AgentTimeoutSeconds <= 0 {
-		c.AgentTimeoutSeconds = 180
+		c.AgentTimeoutSeconds = 420
 	}
 	if c.AgentRuntimeTTLMinutes <= 0 {
 		c.AgentRuntimeTTLMinutes = 120

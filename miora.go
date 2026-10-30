@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -217,19 +218,37 @@ var directTransportCache struct {
 	transport *http.Transport
 }
 
-func directTransport(proxy string) *http.Transport {
-	if proxy == "" {
-		return http.DefaultTransport.(*http.Transport)
+// proxySettingOf returns the configured proxy for transport selection.
+func proxySettingOf(cfg *Config) string {
+	if cfg == nil {
+		return ""
 	}
+	return cfg.ProxyURL
+}
+
+func directTransport(proxy string) *http.Transport {
 	directTransportCache.Lock()
 	defer directTransportCache.Unlock()
 	if directTransportCache.transport != nil && directTransportCache.proxy == proxy {
 		return directTransportCache.transport
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if strings.EqualFold(proxy, "direct://") {
+	// Go prefers IPv6; on hosts with a broken v6 route every call stalled until its
+	// deadline ("wsarecv: failed to respond") while curl over v4 worked fine.
+	dialer := &net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if conn, errDial := dialer.DialContext(ctx, "tcp4", addr); errDial == nil {
+			return conn, nil
+		}
+		return dialer.DialContext(ctx, network, addr)
+	}
+	transport.TLSHandshakeTimeout = 10 * time.Second
+	transport.ResponseHeaderTimeout = 30 * time.Second
+	transport.ExpectContinueTimeout = time.Second
+	transport.MaxIdleConnsPerHost = 8
+	if !strings.EqualFold(proxy, "") && strings.EqualFold(proxy, "direct://") {
 		transport.Proxy = nil
-	} else if proxyURL, errParse := url.Parse(proxy); errParse == nil {
+	} else if proxyURL, errParse := url.Parse(proxy); errParse == nil && proxyURL.Host != "" {
 		transport.Proxy = http.ProxyURL(proxyURL)
 	}
 	if previous := directTransportCache.transport; previous != nil {
@@ -328,6 +347,17 @@ func languageHeader(cfg *Config) string {
 // requestJSON performs one JSON request and returns the envelope `data` blob. An
 // empty body means no JSON payload.
 func (c *apiClient) requestJSON(ctx context.Context, method, path string, query url.Values, payload any, auth bool) (json.RawMessage, error) {
+	return c.requestJSONWith(ctx, method, path, query, payload, auth, false, 0)
+}
+
+// requestJSONDirect skips the host HTTP bridge. Agent provisioning uses it because
+// a hung host callback would otherwise burn the whole request timeout before the
+// turn even starts, and these calls are small and safe to repeat.
+func (c *apiClient) requestJSONDirect(ctx context.Context, method, path string, query url.Values, payload any, auth bool, timeout time.Duration) (json.RawMessage, error) {
+	return c.requestJSONWith(ctx, method, path, query, payload, auth, true, timeout)
+}
+
+func (c *apiClient) requestJSONWith(ctx context.Context, method, path string, query url.Values, payload any, auth bool, direct bool, timeout time.Duration) (json.RawMessage, error) {
 	target := c.baseURL() + path
 	if len(query) > 0 {
 		target += "?" + query.Encode()
@@ -345,10 +375,20 @@ func (c *apiClient) requestJSON(ctx context.Context, method, path string, query 
 		headers.Del("Authorization")
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, c.cfg.requestTimeout())
+	if timeout <= 0 {
+		timeout = c.cfg.requestTimeout()
+	}
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	result, errDo := doUpstream(timeoutCtx, c.cfg, method, target, headers, body)
+	var result *httpResult
+	var errDo error
+	if direct {
+		result, errDo = doUpstreamDirect(timeoutCtx, c.cfg, method, target, headers, body)
+		recordUpstreamTrace("direct", method, target, statusOf(result), errDo)
+	} else {
+		result, errDo = doUpstream(timeoutCtx, c.cfg, method, target, headers, body)
+	}
 	if errDo != nil {
 		return nil, fmt.Errorf("%s %s: %w", method, path, errDo)
 	}
