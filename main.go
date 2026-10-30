@@ -84,7 +84,7 @@ const providerID = "miora-provider"
 
 const pluginVersion = "0.1.0"
 
-const pluginRepositoryURL = "https://github.com/zjj/cpa-miora-plugin"
+const pluginRepositoryURL = "https://github.com/zyxzjyzjj/cpa-miora-plugin"
 
 var (
 	// currentConfig is replaced wholesale by plugin.register/plugin.reconfigure.

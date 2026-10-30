@@ -1,4 +1,4 @@
-module github.com/zjj/cpa-miora-plugin
+module github.com/zyxzjyzjj/cpa-miora-plugin
 
 go 1.26.0
 
