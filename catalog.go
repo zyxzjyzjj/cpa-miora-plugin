@@ -18,52 +18,58 @@ type catalogSnapshot struct {
 }
 
 var catalogCache struct {
-	mu       sync.RWMutex
-	snapshot catalogSnapshot
-	inflight chan struct{}
+	mu         sync.RWMutex
+	snapshot   catalogSnapshot
+	inflight   chan struct{}
+	generation uint64
 }
 
 // loadCatalog returns the cached catalogue, refreshing it when the TTL expired.
 // Concurrent callers share one upstream request.
 func loadCatalog(ctx context.Context) catalogSnapshot {
 	cache := &catalogCache
-	cache.mu.RLock()
+	cache.mu.Lock()
 	snapshot := cache.snapshot
-	cache.mu.RUnlock()
 
 	ttl := config().catalogTTL()
-	if len(snapshot.Models) > 0 && time.Since(snapshot.FetchedAt) < ttl {
+	if snapshot.Err != "" || len(snapshot.Models) == 0 {
+		ttl = min(ttl, 30*time.Second)
+	}
+	if !snapshot.FetchedAt.IsZero() && time.Since(snapshot.FetchedAt) < ttl {
+		cache.mu.Unlock()
 		return snapshot
 	}
 
-	cache.mu.Lock()
 	if cache.inflight != nil {
 		wait := cache.inflight
 		cache.mu.Unlock()
 		select {
 		case <-wait:
+			return loadCatalog(ctx)
 		case <-ctx.Done():
+			return peekCatalog()
 		}
-		cache.mu.RLock()
-		defer cache.mu.RUnlock()
-		return cache.snapshot
 	}
 	done := make(chan struct{})
 	cache.inflight = done
+	generation := cache.generation
 	cache.mu.Unlock()
 
 	client := newAPIClient(config(), nil)
 	models, tier, errFetch := client.fetchCatalog(ctx)
 
 	cache.mu.Lock()
-	if errFetch == nil && len(models) > 0 {
-		cache.snapshot = catalogSnapshot{Models: models, Tier: tier, FetchedAt: time.Now()}
-	} else {
-		cache.snapshot.Err = ""
-		if errFetch != nil {
-			cache.snapshot.Err = errFetch.Error()
+	// Discard results from a configuration invalidated during the fetch.
+	if generation == cache.generation {
+		if errFetch == nil && len(models) > 0 {
+			cache.snapshot = catalogSnapshot{Models: models, Tier: tier, FetchedAt: time.Now()}
+		} else {
+			cache.snapshot.Err = ""
+			if errFetch != nil {
+				cache.snapshot.Err = errFetch.Error()
+			}
+			cache.snapshot.FetchedAt = time.Now()
 		}
-		cache.snapshot.FetchedAt = time.Now()
 	}
 	snapshot = cache.snapshot
 	cache.inflight = nil
@@ -82,6 +88,7 @@ func peekCatalog() catalogSnapshot {
 // invalidateCatalog forces the next load to hit the upstream.
 func invalidateCatalog() {
 	catalogCache.mu.Lock()
+	catalogCache.generation++
 	catalogCache.snapshot.FetchedAt = time.Time{}
 	catalogCache.mu.Unlock()
 }
@@ -192,7 +199,7 @@ func catalogueModels(cfg *Config) []catalogModel {
 	}
 	for _, override := range cfg.Models {
 		upstream := strings.TrimSpace(override.Upstream)
-		if upstream == "" {
+		if upstream == "" || !cfg.modelAllowed(upstream) {
 			continue
 		}
 		if _, ok := seen[strings.ToLower(upstream)]; ok {

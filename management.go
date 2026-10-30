@@ -761,24 +761,22 @@ func handlePanelGenerate(body []byte) pluginapi.ManagementResponse {
 	if errModel != nil {
 		return errorJSON(http.StatusBadRequest, errModel.Error())
 	}
-	generation, errBuild := buildGeneration(cfg, cred, parsed, model, media)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.taskTimeout()+30*time.Second)
+	release, acquired := generationPermits.acquire(cfg.MaxConcurrentTasks)
+	if !acquired {
+		cancel()
+		return errorJSON(http.StatusTooManyRequests, "生成并发已满，请稍后重试")
+	}
+	generation, errBuild := buildGeneration(ctx, cfg, cred, parsed, model, media)
 	if errBuild != nil {
+		release()
+		cancel()
 		return errorJSON(http.StatusBadRequest, errBuild.Error())
 	}
 
 	cfgCopy := *cfg
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), cfgCopy.taskTimeout()+30*time.Second)
 		defer cancel()
-		release, errPermit := acquirePermit(ctx, &cfgCopy)
-		if errPermit != nil {
-			recordTask(taskRecord{
-				ID: taskIDFor(generation), TaskID: "", Account: cred.displayLabel(), Model: model,
-				Media: media, Prompt: truncateRunes(generation.Prompt, 400), Status: "failed",
-				Error: "生成并发已满", StartedAt: formatTime(time.Now()), FinishedAt: formatTime(time.Now()),
-			})
-			return
-		}
 		defer release()
 		_, errRun := runGeneration(ctx, &cfgCopy, cred, generation, nil)
 		if errRun != nil {
@@ -792,10 +790,6 @@ func handlePanelGenerate(body []byte) pluginapi.ManagementResponse {
 		"media":   media,
 		"message": "已提交生成，可在此页查看任务进度",
 	})
-}
-
-func taskIDFor(generation generateRequest) string {
-	return fmt.Sprintf("panel-%d", time.Now().UnixNano())
 }
 
 func mediaPayload(limit int) []map[string]any {

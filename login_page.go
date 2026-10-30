@@ -123,7 +123,7 @@ const loginTemplate = `<!doctype html>
     statusEl.className = "status " + (kind || "");
   }
   function post(path, body) {
-    return fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) })
+    return fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Login-State": state }, body: JSON.stringify(body || {}) })
       .then(function (response) {
         return response.text().then(function (text) {
           var data = null;
@@ -141,9 +141,6 @@ const loginTemplate = `<!doctype html>
   function finish(email) {
     document.body.classList.add("done-ok");
     document.getElementById("doneText").textContent = "已导入 " + (email || "Miora 账号") + "，可以关闭此页面。";
-    setInterval(function () {
-      fetch("/api/state").then(function (r) { return r.json(); }).catch(function () {});
-    }, 4000);
   }
 
   document.getElementById("scan").addEventListener("click", function () {
@@ -176,7 +173,7 @@ const loginTemplate = `<!doctype html>
     var candidate = payload[Number(btn.dataset.index)];
     if (!candidate) { return; }
     btn.disabled = true;
-    post("/api/submit", { auth_token: candidate.auth_token, refresh_token: candidate.refresh_token }).then(function (data) {
+    post("/api/submit", { candidate_index: Number(btn.dataset.index) }).then(function (data) {
       finish(data.email);
     }).catch(function (error) {
       say(error.message, "err");

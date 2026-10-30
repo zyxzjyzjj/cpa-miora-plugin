@@ -149,13 +149,13 @@ curl http://127.0.0.1:8317/v1/chat/completions \
     "index": 0,
     "message": {
       "role": "assistant",
-      "content": "![Miora image](https://sign.miorausercontent.com/file/.../xPS_qpVaBk0zy9lT.png?...)\n\n> hy-image-3.5-f · 1:1 · 1.5K · 15.8s\n> 链接 1 小时内有效，可用面板按 fileKey 重新签名（不会重复扣费）。"
+      "content": "![Miora image](https://sign.miorausercontent.com/file/.../example-image.png?...)\n\n> hy-image-3.5-f · 1:1 · 1.5K · 15.8s\n> 链接 1 小时内有效，可用面板按 fileKey 重新签名（不会重复扣费）。"
     },
     "finish_reason": "stop"
   }],
   "miora": {
-    "task_ids": ["fdd4cc15-1109-4997-994a-68a25e3ac0ed"],
-    "files": [{"file_key": "file/741997187129584/2026/10/30/.../xPS_qpVaBk0zy9lT.png", "url": "https://...", "type": "image"}],
+    "task_ids": ["00000000-0000-4000-8000-000000000001"],
+    "files": [{"file_key": "file/example-user/2026/10/30/.../example-image.png", "url": "https://...", "type": "image"}],
     "credits": 0
   }
 }
@@ -227,7 +227,7 @@ CPA 会把 Anthropic / Gemini / Responses 客户端的请求翻译成本插件�
 - **日志**：请求记录（状态 / 额度 / 耗时 / 提示词 / 错误）
 - **设置**：参数写回 CPA 的 `plugins.configs`，保存后触发 `plugin.reconfigure`；附带自检（目录 / 登录态 / 额度 / 上游调用轨迹）
 
-管理密钥获取方式与 CPA 生态一致：同源 iframe 打开时自动读主面板 `localStorage` 的 `cli-proxy-auth`（AES 前缀 `enc::v1::` 解混淆），也支持 `?key=` 一次性参数（用完即从地址栏抹掉）或手动输入。
+管理密钥获取方式与 CPA 生态一致：同源 iframe 打开时自动读主面板 `localStorage` 的 `cli-proxy-auth`（`enc::v1::` 前缀的 XOR 解混淆，不是安全加密），也支持 `#key=` 一次性参数（fragment 不会发给服务器，读取后从地址栏清除）或手动输入。
 
 ---
 
@@ -294,7 +294,7 @@ CPA 会把 Anthropic / Gemini / Responses 客户端的请求翻译成本插件�
 | 额度显示 0，但生成成功 | `/api/ai/quota/credit` 对免费档常返回 0，平台用另一套免费池计费；以任务是否成功为准，面板日志里有真实扣费字段 |
 | 任务超时 | 视频 / 3D 本来就要 60–180s，调大 `task_timeout_seconds`；任务在上游仍会继续，稍后用面板按 `file_key` 重签 |
 | 参考图报「需要开启 upload_reference_images」 | COS 直传默认关闭；或改成传 `miora://file/...` 的已有文件 |
-| 面板打不开 / 401 | 管理密钥没带：从 CPA 主面板进入，或 `?key=<管理密钥>` |
+| 面板打不开 / 401 | 管理密钥没带：从 CPA 主面板进入，或 `#key=<管理密钥>` |
 | 模型列表为空 | `GET /models` 看 `error`；目录接口免登录，通常是被代理挡了，设 `proxy_url` 或 `direct://` |
 
 ---

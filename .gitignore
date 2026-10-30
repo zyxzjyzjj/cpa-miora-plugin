@@ -19,3 +19,17 @@ release-assets/
 Thumbs.db
 .idea/
 .vscode/
+
+# Local credentials and deployment configuration
+.env
+.env.*
+!.env.example
+auths/
+config.yaml
+config.yml
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519

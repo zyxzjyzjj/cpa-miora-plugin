@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -382,10 +381,11 @@ type loginSession struct {
 	server   *http.Server
 	expires  time.Time
 
-	mu     sync.Mutex
-	cred   *credential
-	errMsg string
-	closed bool
+	mu         sync.Mutex
+	cred       *credential
+	candidates []browserCandidate
+	errMsg     string
+	closed     bool
 }
 
 var (
@@ -410,12 +410,6 @@ func authLoginStart(request []byte) ([]byte, error) {
 	}
 	loginMu.Lock()
 	loginSessions[session.State] = session
-	for state, existing := range loginSessions {
-		if time.Now().After(existing.expires) {
-			existing.close()
-			delete(loginSessions, state)
-		}
-	}
 	loginMu.Unlock()
 
 	return okEnvelope(pluginapi.AuthLoginStartResponse{
@@ -441,7 +435,7 @@ func authLoginPoll(request []byte) ([]byte, error) {
 	loginMu.Lock()
 	session := loginSessions[req.State]
 	loginMu.Unlock()
-	if session == nil {
+	if session == nil || time.Now().After(session.expires) {
 		return okEnvelope(pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: "登录会话不存在或已过期，请重新发起登录。",
@@ -464,12 +458,6 @@ func authLoginPoll(request []byte) ([]byte, error) {
 			Message: errMsg,
 		})
 	}
-	if time.Now().After(session.expires) {
-		return okEnvelope(pluginapi.AuthLoginPollResponse{
-			Status:  pluginapi.AuthLoginStatusError,
-			Message: "登录页已过期，请重新发起登录。",
-		})
-	}
 	return okEnvelope(pluginapi.AuthLoginPollResponse{
 		Status:  pluginapi.AuthLoginStatusPending,
 		Message: "等待在登录页完成导入…",
@@ -488,10 +476,33 @@ func (s *loginSession) start(cfg *Config) error {
 	mux.HandleFunc("/api/state", s.handleState)
 	mux.HandleFunc("/api/submit", s.handleSubmit)
 	mux.HandleFunc("/api/browser-scan", s.handleBrowserScan)
-	s.server = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	s.server = &http.Server{Handler: s.authorize(mux), ReadHeaderTimeout: 10 * time.Second}
 	go func() { _ = s.server.Serve(listener) }()
-	time.AfterFunc(11*time.Minute, s.close)
+	time.AfterFunc(time.Until(s.expires), s.close)
 	return nil
+}
+
+func (s *loginSession) authorize(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		s.mu.Lock()
+		expired := s.closed || time.Now().After(s.expires)
+		s.mu.Unlock()
+		if expired {
+			writeJSON(w, http.StatusGone, map[string]any{"ok": false, "error": "登录页已过期"})
+			return
+		}
+		state := r.Header.Get("X-Login-State")
+		if r.URL.Path == "/" {
+			state = r.URL.Query().Get("state")
+		}
+		if state != s.State {
+			writeJSON(w, http.StatusForbidden, map[string]any{"ok": false, "error": "登录 state 无效"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *loginSession) close() {
@@ -501,7 +512,12 @@ func (s *loginSession) close() {
 		return
 	}
 	s.closed = true
+	s.cred = nil
+	s.candidates = nil
 	s.mu.Unlock()
+	loginMu.Lock()
+	delete(loginSessions, s.State)
+	loginMu.Unlock()
 	if s.server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = s.server.Shutdown(ctx)
@@ -509,6 +525,18 @@ func (s *loginSession) close() {
 	}
 	if s.listener != nil {
 		_ = s.listener.Close()
+	}
+}
+
+func stopLoginSessions() {
+	loginMu.Lock()
+	sessions := make([]*loginSession, 0, len(loginSessions))
+	for _, session := range loginSessions {
+		sessions = append(sessions, session)
+	}
+	loginMu.Unlock()
+	for _, session := range sessions {
+		session.close()
 	}
 }
 
@@ -558,9 +586,10 @@ func (s *loginSession) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		AuthToken    string `json:"auth_token"`
-		RefreshToken string `json:"refresh_token"`
-		Label        string `json:"label"`
+		AuthToken      string `json:"auth_token"`
+		RefreshToken   string `json:"refresh_token"`
+		Label          string `json:"label"`
+		CandidateIndex *int   `json:"candidate_index"`
 	}
 	if errDecode := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); errDecode != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "请求格式错误：" + errDecode.Error()})
@@ -571,6 +600,19 @@ func (s *loginSession) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		RefreshToken: strings.TrimSpace(body.RefreshToken),
 		Label:        strings.TrimSpace(body.Label),
 		Source:       "manual",
+	}
+	if body.CandidateIndex != nil {
+		s.mu.Lock()
+		index := *body.CandidateIndex
+		if index < 0 || index >= len(s.candidates) {
+			s.mu.Unlock()
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "请重新扫描浏览器"})
+			return
+		}
+		candidate := s.candidates[index]
+		s.mu.Unlock()
+		cred.AuthToken, cred.RefreshToken = candidate.AuthToken, candidate.RefreshToken
+		cred.Source = "browser"
 	}
 	imported, errImport := importCredential(r.Context(), config(), cred)
 	if errImport != nil {
@@ -583,6 +625,10 @@ func (s *loginSession) handleSubmit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *loginSession) handleBrowserScan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "method not allowed"})
+		return
+	}
 	if !config().EnableBrowserImport {
 		writeJSON(w, http.StatusForbidden, map[string]any{"ok": false, "error": "浏览器导入已在插件配置中关闭"})
 		return
@@ -592,6 +638,9 @@ func (s *loginSession) handleBrowserScan(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": errScan.Error()})
 		return
 	}
+	s.mu.Lock()
+	s.candidates = candidates
+	s.mu.Unlock()
 	views := make([]map[string]any, 0, len(candidates))
 	for _, candidate := range candidates {
 		views = append(views, map[string]any{
@@ -662,51 +711,52 @@ func normalizeProvider(value string) string {
 // startBackground (re)starts the token keeper. The plugin ABI has no timer, so
 // the plugin owns its own ticker; quiesce stops it before the host unloads us.
 func startBackground(cfg *Config) {
-	stopBackground()
+	background.mu.Lock()
+	defer background.mu.Unlock()
+	stopBackgroundLocked()
 	if cfg == nil {
 		return
 	}
-	if !background.running.CompareAndSwap(false, true) {
-		return
-	}
-	stop := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	background.stop = stop
-	background.done = done
+	background.cancel, background.done = cancel, done
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()
-		// First sweep shortly after load, so a just-imported expiring token heals
-		// without waiting a full interval.
 		first := time.NewTimer(45 * time.Second)
 		defer first.Stop()
 		for {
 			select {
-			case <-stop:
+			case <-ctx.Done():
 				return
 			case <-first.C:
-				refreshDueCredentials(context.Background(), config())
+				refreshDueCredentials(ctx, config())
 			case <-ticker.C:
-				refreshDueCredentials(context.Background(), config())
+				refreshDueCredentials(ctx, config())
 			}
 		}
 	}()
 }
 
 func stopBackground() {
-	if background.running.CompareAndSwap(true, false) {
-		if background.stop != nil {
-			close(background.stop)
-			background.stop = nil
-		}
+	background.mu.Lock()
+	defer background.mu.Unlock()
+	stopBackgroundLocked()
+}
+
+func stopBackgroundLocked() {
+	if background.cancel != nil {
+		background.cancel()
+		<-background.done
+		background.cancel, background.done = nil, nil
 	}
 }
 
 var background struct {
-	running atomic.Bool
-	stop    chan struct{}
-	done    chan struct{}
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 // refreshDueCredentials walks the host auth records of this provider and rotates
@@ -724,6 +774,9 @@ func refreshDueCredentials(ctx context.Context, cfg *Config) {
 		return
 	}
 	for _, entry := range list.Files {
+		if ctx.Err() != nil {
+			return
+		}
 		if !strings.EqualFold(entry.Provider, providerID) && !strings.EqualFold(entry.Type, providerID) {
 			continue
 		}

@@ -121,7 +121,7 @@ func staticModels() pluginapi.ModelResponse {
 
 // modelsForAuth returns the same catalogue for a specific account. Miora's media
 // catalogue is not account specific (only the available flag differs), so the
-// response is identical, but the call also carries the account tier through.
+// response is identical and needs no authenticated profile request.
 func modelsForAuth(request []byte) ([]byte, error) {
 	var req pluginapi.AuthModelRequest
 	if len(request) > 0 {
@@ -130,19 +130,6 @@ func modelsForAuth(request []byte) ([]byte, error) {
 		}
 	}
 	models := modelInfos()
-	if cred, errCred := credentialFromStorage(req.StorageJSON); errCred == nil && cred.valid() {
-		ctx, cancel := contextWithTimeout(15 * time.Second)
-		defer cancel()
-		if profile, errProfile := newAPIClient(config(), cred).fetchProfile(ctx); errProfile == nil && profile != nil {
-			// Annotate the owner so /v1/models shows which account serves it, without
-			// changing the model IDs clients use.
-			for index := range models {
-				if models[index].Description == "" {
-					models[index].Description = "Miora " + mediaLabel(models[index].Type)
-				}
-			}
-		}
-	}
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerID, Models: models})
 }
 
@@ -184,7 +171,7 @@ func modelInfos() []pluginapi.ModelInfo {
 			Type:                       kind,
 			DisplayName:                firstNonEmpty(model.Label, model.ModelID),
 			Name:                       model.ModelID,
-			Description:                describeCatalogModel(model),
+			Description:                firstNonEmpty(describeCatalogModel(model), "Miora "+mediaLabel(kind)),
 			ContextLength:              int64(model.Capabilities.PromptLengthLimit),
 			MaxCompletionTokens:        0,
 			SupportedGenerationMethods: []string{"chat.completions"},
