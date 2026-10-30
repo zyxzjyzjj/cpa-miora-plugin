@@ -56,9 +56,11 @@ func TestHostFailureDoesNotReplayBillableRequest(t *testing.T) {
 		directCalls.Add(1)
 	}))
 	defer server.Close()
+	hostCfg := defaultConfig()
+	hostCfg.UseHostHTTP = true
 	for _, hostErr := range []error{context.DeadlineExceeded, errors.New("callback failed after submission")} {
 		restore := setHostCall(func(string, any) (json.RawMessage, error) { return nil, hostErr })
-		_, err := doUpstream(context.Background(), defaultConfig(), http.MethodPost, server.URL, nil, []byte(`{}`))
+		_, err := doUpstream(context.Background(), hostCfg, http.MethodPost, server.URL, nil, []byte(`{}`))
 		restore()
 		if !errors.Is(err, hostErr) {
 			t.Fatalf("host error lost: %v", err)
@@ -113,6 +115,7 @@ func TestPlanUploadsReferenceOnceForMultipleResults(t *testing.T) {
 	})
 	defer restore()
 	cfg := defaultConfig()
+	cfg.UseHostHTTP = true
 	cfg.UploadReferenceImages = true
 	plan, err := planExecution(context.Background(), cfg, &executorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
 		StorageJSON: []byte(`{"auth_token":"test-token"}`),

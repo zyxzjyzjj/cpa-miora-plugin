@@ -151,7 +151,7 @@ func defaultConfig() *Config {
 		AgentMode:              agentBypassMode,
 		AgentTimeoutSeconds:    420,
 		AgentRuntimeTTLMinutes: 120,
-		UseHostHTTP:            true,
+		UseHostHTTP:            false,
 		EnableBrowserImport:    true,
 		ResponseFooter:         true,
 	}

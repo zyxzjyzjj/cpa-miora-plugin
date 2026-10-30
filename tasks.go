@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -229,19 +230,52 @@ func runGeneration(ctx context.Context, cfg *Config, cred *credential, req gener
 	ctx, cancel := context.WithTimeout(ctx, cfg.taskTimeout())
 	defer cancel()
 	started := time.Now()
-	client := newAPIClient(cfg, cred)
 	if onProgress != nil {
 		onProgress("submitting", 0, "已提交到 Miora")
 	}
+	taskID, errSubmit := submitGeneration(ctx, cfg, cred, req, started)
+	if errSubmit != nil {
+		return nil, errSubmit
+	}
+	return awaitGeneration(ctx, cfg, cred, req, taskID, started, onProgress)
+}
+
+// submitGeneration posts one media task and records a visible row immediately, so
+// the panel shows the request even while it is still running and gets a real error
+// when Miora rejects it (for example the free tier's one-concurrent-3D rule).
+func submitGeneration(ctx context.Context, cfg *Config, cred *credential, req generateRequest, started time.Time) (string, error) {
+	client := newAPIClient(cfg, cred)
 	taskID, errSubmit := client.submitTask(ctx, req)
 	if errSubmit != nil {
+		recordTask(taskRecord{
+			ID: taskKey(req, started), Account: cred.displayLabel(), Model: req.Model,
+			Media: req.Media, Prompt: truncateRunes(req.Prompt, 400), Status: "submit_failed",
+			Error: errSubmit.Error(), StartedAt: formatTime(started), FinishedAt: formatTime(time.Now()),
+			ElapsedMS: time.Since(started).Milliseconds(),
+		})
 		recordEvent(eventRecord{
 			Time: time.Now(), Account: cred.displayLabel(), Model: req.Model,
 			Media: req.Media, Prompt: truncateRunes(req.Prompt, 160), Status: "submit_failed",
 			Error: errSubmit.Error(), ElapsedMS: time.Since(started).Milliseconds(),
 		})
-		return nil, errSubmit
+		return "", errSubmit
 	}
+	recordTask(taskRecord{
+		ID: taskID, TaskID: taskID, Account: cred.displayLabel(), Model: req.Model,
+		Media: req.Media, Prompt: truncateRunes(req.Prompt, 400), Status: "submitted",
+		StartedAt: formatTime(started),
+	})
+	return taskID, nil
+}
+
+// taskKey builds a stable row id for requests that never reached Miora.
+func taskKey(req generateRequest, started time.Time) string {
+	return "local-" + strconv.FormatInt(started.UnixNano(), 36) + "-" + strings.ReplaceAll(req.Media, "_", "")
+}
+
+// awaitGeneration polls one submitted task until it finishes.
+func awaitGeneration(ctx context.Context, cfg *Config, cred *credential, req generateRequest, taskID string, started time.Time, onProgress progressFunc) (_ *generationResult, runErr error) {
+	client := newAPIClient(cfg, cred)
 	// Every exit after submission leaves a terminal row, including cancellation
 	// during a request, a polling sleep, or result signing.
 	defer func() {
@@ -269,6 +303,7 @@ func runGeneration(ctx context.Context, cfg *Config, cred *credential, req gener
 	}()
 	lastStatus := ""
 	lastProgress := 0.0
+	pollFailures := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -278,6 +313,14 @@ func runGeneration(ctx context.Context, cfg *Config, cred *credential, req gener
 			var upstream *upstreamError
 			if errors.As(errPoll, &upstream) && (upstream.isAuthError() || upstream.Status >= 400 && upstream.Status < 500) {
 				return nil, errPoll
+			}
+			// Transient polling failures are retried, but they must be visible: a
+			// silent loop looks like "the task never progresses" in the panel.
+			pollFailures++
+			if pollFailures <= 3 || pollFailures%10 == 0 {
+				logWarn("task poll failed", map[string]any{
+					"task": taskID, "media": req.Media, "attempt": pollFailures, "error": errPoll.Error(),
+				})
 			}
 		}
 		if state, ok := states[taskID]; ok {

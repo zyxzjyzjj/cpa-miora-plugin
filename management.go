@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -790,12 +791,24 @@ func handlePanelGenerate(body []byte) pluginapi.ManagementResponse {
 	}
 
 	cfgCopy := *cfg
+	// Submit synchronously: Miora answers in well under a second, and the caller
+	// needs the real rejection (free-tier concurrency limits, bad params) instead of
+	// a 200 followed by silence in the background.
+	started := time.Now()
+	submitCtx, cancelSubmit := context.WithTimeout(ctx, cfgCopy.requestTimeout())
+	taskID, errSubmit := submitGeneration(submitCtx, &cfgCopy, cred, generation, started)
+	cancelSubmit()
+	if errSubmit != nil {
+		release()
+		cancel()
+		return panelGenerationFailure(errSubmit)
+	}
+
 	go func() {
 		defer cancel()
 		defer release()
-		_, errRun := runGeneration(ctx, &cfgCopy, cred, generation, nil)
-		if errRun != nil {
-			logWarn("panel generation failed", map[string]any{"error": errRun.Error()})
+		if _, errRun := awaitGeneration(ctx, &cfgCopy, cred, generation, taskID, started, nil); errRun != nil {
+			logWarn("panel generation failed", map[string]any{"task": taskID, "error": errRun.Error()})
 		}
 	}()
 
@@ -803,8 +816,26 @@ func handlePanelGenerate(body []byte) pluginapi.ManagementResponse {
 		"ok":      true,
 		"model":   model,
 		"media":   media,
+		"task_id": taskID,
 		"message": "已提交生成，可在此页查看任务进度",
 	})
+}
+
+// panelGenerationFailure turns an upstream rejection into something the panel can
+// show verbatim.
+func panelGenerationFailure(err error) pluginapi.ManagementResponse {
+	var upstream *upstreamError
+	if errors.As(err, &upstream) {
+		message := strings.TrimSpace(upstream.Message)
+		if strings.Contains(strings.ToLower(message), "concurrent task limit") {
+			return errorJSON(http.StatusTooManyRequests,
+				"Miora 免费档对同一类任务有并发上限（3D 只允许 1 个同时跑）。等当前任务结束后再试，或换一个模型。")
+		}
+		if message != "" {
+			return errorJSON(upstream.Status, message)
+		}
+	}
+	return errorJSON(http.StatusBadGateway, "提交失败："+err.Error())
 }
 
 func mediaPayload(limit int) []map[string]any {

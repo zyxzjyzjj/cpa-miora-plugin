@@ -683,6 +683,30 @@ func (f *flexFloat) UnmarshalJSON(raw []byte) error {
 
 func (f flexFloat) value() float64 { return float64(f) }
 
+// flexString accepts either a JSON string or a number. Miora's progress endpoint
+// returns createdAt as an epoch number while other endpoints quote it, and a plain
+// string field made the whole batch failing to decode (so polling never advanced).
+type flexString string
+
+func (f *flexString) UnmarshalJSON(raw []byte) error {
+	text := strings.TrimSpace(string(raw))
+	if text == "" || text == "null" {
+		*f = ""
+		return nil
+	}
+	if len(text) >= 2 && text[0] == '"' {
+		var decoded string
+		if errUnquote := json.Unmarshal(raw, &decoded); errUnquote == nil {
+			*f = flexString(decoded)
+			return nil
+		}
+	}
+	*f = flexString(strings.Trim(text, `"`))
+	return nil
+}
+
+func (f flexString) String() string { return string(f) }
+
 // refreshTokens exchanges a refresh token for a fresh access token. The refresh
 // token rotates on every call, so the caller must persist the new pair
 // immediately; replaying an old refresh token yields HTTP 400.
@@ -829,8 +853,8 @@ type taskState struct {
 	GeneratedAssets []taskAsset  `json:"generatedAssets"`
 	Metadata        taskMetadata `json:"metadata"`
 	TaskType        string       `json:"taskType"`
-	CreatedAt       string       `json:"createdAt"`
-	UpdatedAt       string       `json:"updatedAt"`
+	CreatedAt       flexString   `json:"createdAt"`
+	UpdatedAt       flexString   `json:"updatedAt"`
 }
 
 type taskAsset struct {

@@ -222,3 +222,18 @@ func TestAgentStatusViewDoesNotDeadlock(t *testing.T) {
 		t.Fatal("agentStatusView deadlocked: it must not call knownAgentModels while holding agentRuntimes.mu")
 	}
 }
+
+func TestTaskStateAcceptsNumericTimestamps(t *testing.T) {
+	// Shape returned by /api/ai/media-generate/progress: createdAt is an epoch number.
+	raw := []byte(`{"taskId":"abc","status":"completed","progress":100,"createdAt":1793376268877,"updatedAt":1793376300000,"assets":[{"fileKey":"file/x.mp4","fileType":"video"}]}`)
+	var state taskState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatalf("progress payload must decode even with numeric timestamps: %v", err)
+	}
+	if state.TaskID != "abc" || state.Status != "completed" || len(state.Assets) != 1 {
+		t.Fatalf("unexpected state: %+v", state)
+	}
+	if state.CreatedAt.String() != "1793376268877" {
+		t.Fatalf("epoch timestamp lost: %q", state.CreatedAt)
+	}
+}
