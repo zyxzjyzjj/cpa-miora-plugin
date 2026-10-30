@@ -87,7 +87,7 @@ import (
 // auth file `type`. It must stay lowercase: the host normalises provider names.
 const providerID = "miora-provider"
 
-const pluginVersion = "0.2.3"
+const pluginVersion = "0.2.4"
 
 const pluginRepositoryURL = "https://github.com/zyxzjyzjj/cpa-miora-plugin"
 

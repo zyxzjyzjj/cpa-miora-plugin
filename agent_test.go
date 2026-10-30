@@ -193,3 +193,32 @@ func TestMediaURLsFromToolOutput(t *testing.T) {
 		t.Fatalf("non-media tool output should yield nothing: %v", extra)
 	}
 }
+
+func TestAgentStatusViewDoesNotDeadlock(t *testing.T) {
+	cfg := defaultConfig()
+	agentRuntimes.mu.Lock()
+	previous := agentRuntimes.byAccount
+	previousModels := agentRuntimes.models
+	agentRuntimes.byAccount = map[string]*agentRuntime{
+		"acct": {ProjectID: "p1", RuntimeID: "r1", Created: time.Now(), Models: []agentModel{{ID: "deepseek-v4.1-flash"}}},
+	}
+	agentRuntimes.models = []agentModel{{ID: "deepseek-v4.1-flash"}}
+	agentRuntimes.mu.Unlock()
+	t.Cleanup(func() {
+		agentRuntimes.mu.Lock()
+		agentRuntimes.byAccount = previous
+		agentRuntimes.models = previousModels
+		agentRuntimes.mu.Unlock()
+	})
+
+	done := make(chan map[string]any, 1)
+	go func() { done <- agentStatusView(cfg) }()
+	select {
+	case view := <-done:
+		if view["catalogue"] == nil {
+			t.Fatalf("status view missing catalogue: %+v", view)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("agentStatusView deadlocked: it must not call knownAgentModels while holding agentRuntimes.mu")
+	}
+}

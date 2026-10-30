@@ -319,10 +319,21 @@ func forgetAgentRuntime(cfg *Config, cred *credential) {
 
 // agentStatusView is what the panel shows about the ACP bridge.
 func agentStatusView(cfg *Config) map[string]any {
+	// Snapshot under the lock, then look the catalogue up outside it: knownAgentModels
+	// takes the same mutex and sync.Mutex is not reentrant, so calling it while
+	// holding the lock deadlocked every /models request (empty studio selects).
 	agentRuntimes.mu.Lock()
-	defer agentRuntimes.mu.Unlock()
-	accounts := make([]map[string]any, 0, len(agentRuntimes.byAccount))
+	runtimes := make([]agentRuntime, 0, len(agentRuntimes.byAccount))
+	keys := make([]string, 0, len(agentRuntimes.byAccount))
 	for key, runtime := range agentRuntimes.byAccount {
+		keys = append(keys, key)
+		runtimes = append(runtimes, *runtime)
+	}
+	agentRuntimes.mu.Unlock()
+
+	accounts := make([]map[string]any, 0, len(keys))
+	for index, key := range keys {
+		runtime := runtimes[index]
 		accounts = append(accounts, map[string]any{
 			"account":       key,
 			"project_id":    runtime.ProjectID,
