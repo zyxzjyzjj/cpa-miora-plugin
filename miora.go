@@ -28,6 +28,8 @@ const (
 	pathTiers          = "/api/ai/public/cloud-agent/tiers"
 	pathProfile        = "/api/ai/user/profile"
 	pathCredit         = "/api/ai/quota/credit"
+	pathBillingCredit  = "/api/miora-billing/credit"
+	pathBillingSub     = "/api/miora-billing/subscription"
 	pathRefreshToken   = "/api/auth/refresh-token"
 	pathGeneratePrefix = "/api/ai/media-generate/"
 	pathImageQuery     = "/api/ai/async-task/batch-query"
@@ -489,12 +491,21 @@ func (c *apiClient) fetchProfile(ctx context.Context) (*profileInfo, error) {
 	return profile, nil
 }
 
-// creditInfo is the authoritative balance view (/api/ai/quota/credit). The
-// `cr` field in localStorage is not trustworthy, this endpoint is.
+// creditInfo is the authoritative balance view. The `cr` field in localStorage is
+// not trustworthy; Miora serves the real numbers from the billing service.
+//
+// POST /api/miora-billing/credit  -> {totalAmount, usedAmount, nextExpiring}
+// POST /api/miora-billing/subscription -> {tierCode, tierName, creditTotal, creditLeft}
+//
+// /api/ai/quota/credit exists as well but reports 0 for free accounts, which is
+// what the panel used to show while the site displayed 250 credits.
 type creditInfo struct {
-	TotalAmount  flexFloat `json:"total_amount"`
-	UsedAmount   flexFloat `json:"used_amount"`
-	NextExpiring string    `json:"nextExpiring"`
+	TotalAmount  flexFloat `json:"-"`
+	UsedAmount   flexFloat `json:"-"`
+	NextExpiring string    `json:"-"`
+	ExpiresAt    string    `json:"-"`
+	TierName     string    `json:"-"`
+	Source       string    `json:"-"`
 }
 
 func (c *creditInfo) remaining() float64 {
@@ -505,15 +516,82 @@ func (c *creditInfo) remaining() float64 {
 }
 
 func (c *apiClient) fetchCredits(ctx context.Context) (*creditInfo, error) {
+	// Billing service first: it is what the web app renders.
+	credits, errBilling := c.fetchBillingCredits(ctx)
+	if errBilling == nil {
+		return credits, nil
+	}
 	data, errFetch := c.requestJSON(ctx, http.MethodGet, pathCredit, nil, nil, true)
 	if errFetch != nil {
-		return nil, errFetch
+		return nil, errBilling
 	}
-	credits := &creditInfo{}
-	if errUnmarshal := json.Unmarshal(data, credits); errUnmarshal != nil {
+	legacy := struct {
+		TotalAmount flexFloat `json:"total_amount"`
+		UsedAmount  flexFloat `json:"used_amount"`
+	}{}
+	if errUnmarshal := json.Unmarshal(data, &legacy); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode credits: %w", errUnmarshal)
 	}
-	return credits, nil
+	return &creditInfo{TotalAmount: legacy.TotalAmount, UsedAmount: legacy.UsedAmount, Source: "quota/credit"}, nil
+}
+
+// fetchBillingCredits reads the real balance plus the plan name.
+func (c *apiClient) fetchBillingCredits(ctx context.Context) (*creditInfo, error) {
+	data, errPost := c.requestJSON(ctx, http.MethodPost, pathBillingCredit, nil, map[string]any{}, true)
+	if errPost != nil {
+		return nil, errPost
+	}
+	payload := struct {
+		TotalAmount  flexFloat `json:"totalAmount"`
+		UsedAmount   flexFloat `json:"usedAmount"`
+		NextExpiring *struct {
+			Credit    flexFloat `json:"credit"`
+			ExpiredAt string    `json:"expiredAt"`
+		} `json:"nextExpiring"`
+	}{}
+	if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode billing credit: %w", errUnmarshal)
+	}
+	out := &creditInfo{
+		TotalAmount: payload.TotalAmount,
+		UsedAmount:  payload.UsedAmount,
+		Source:      "miora-billing/credit",
+	}
+	if payload.NextExpiring != nil {
+		out.ExpiresAt = payload.NextExpiring.ExpiredAt
+	}
+	if sub, errSub := c.fetchBillingSubscription(ctx); errSub == nil && sub != nil {
+		out.TierName = sub.TierName
+		if out.TotalAmount.value() == 0 && sub.CreditTotal.value() > 0 {
+			out.TotalAmount = sub.CreditTotal
+			out.UsedAmount = flexFloat(sub.CreditTotal.value() - sub.CreditLeft.value())
+		}
+		if out.ExpiresAt == "" {
+			out.ExpiresAt = sub.ExpireAt
+		}
+	}
+	return out, nil
+}
+
+type billingSubscription struct {
+	TierCode    string    `json:"tierCode"`
+	TierName    string    `json:"tierName"`
+	CreditTotal flexFloat `json:"creditTotal"`
+	CreditLeft  flexFloat `json:"creditLeft"`
+	Status      string    `json:"status"`
+	ExpireAt    string    `json:"expireAt"`
+}
+
+func (c *apiClient) fetchBillingSubscription(ctx context.Context) (*billingSubscription, error) {
+	data, errPost := c.requestJSON(ctx, http.MethodPost, pathBillingSub, nil, map[string]any{}, true)
+	if errPost != nil {
+		return nil, errPost
+	}
+	sub := &billingSubscription{}
+	if errUnmarshal := json.Unmarshal(data, sub); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode billing subscription: %w", errUnmarshal)
+	}
+	return sub, nil
 }
 
 // flexFloat accepts both 12.5 and "12.5", which Miora mixes across endpoints.

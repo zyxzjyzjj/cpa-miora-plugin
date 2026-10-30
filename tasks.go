@@ -32,20 +32,23 @@ type generationResult struct {
 
 // taskRecord is one row of the panel's task history.
 type taskRecord struct {
-	ID         string      `json:"id"`
-	TaskID     string      `json:"task_id"`
-	Account    string      `json:"account"`
-	Model      string      `json:"model"`
-	Media      string      `json:"media"`
-	Prompt     string      `json:"prompt"`
-	Status     string      `json:"status"`
-	Progress   float64     `json:"progress"`
-	Credit     float64     `json:"credit"`
-	Error      string      `json:"error,omitempty"`
-	Files      []mediaFile `json:"files"`
-	StartedAt  time.Time   `json:"started_at"`
-	FinishedAt time.Time   `json:"finished_at"`
-	ElapsedMS  int64       `json:"elapsed_ms"`
+	ID       string      `json:"id"`
+	TaskID   string      `json:"task_id"`
+	Account  string      `json:"account"`
+	Model    string      `json:"model"`
+	Media    string      `json:"media"`
+	Prompt   string      `json:"prompt"`
+	Status   string      `json:"status"`
+	Progress float64     `json:"progress"`
+	Credit   float64     `json:"credit"`
+	Error    string      `json:"error,omitempty"`
+	Files    []mediaFile `json:"files"`
+	// Times are RFC3339 strings, empty until known: a zero time.Time would
+	// serialise as "0001-01-01T00:00:00Z" and the panel rendered it as
+	// "739918 天前" for every task that had not finished yet.
+	StartedAt  string `json:"started_at,omitempty"`
+	FinishedAt string `json:"finished_at,omitempty"`
+	ElapsedMS  int64  `json:"elapsed_ms"`
 }
 
 // eventRecord is one request-log row.
@@ -104,8 +107,11 @@ func upsertTask(record taskRecord) {
 			if record.TaskID != "" {
 				merged.TaskID = record.TaskID
 			}
-			if !record.FinishedAt.IsZero() {
+			if record.FinishedAt != "" {
 				merged.FinishedAt = record.FinishedAt
+			}
+			if merged.StartedAt == "" && record.StartedAt != "" {
+				merged.StartedAt = record.StartedAt
 			}
 			if record.ElapsedMS > 0 {
 				merged.ElapsedMS = record.ElapsedMS
@@ -232,7 +238,7 @@ func runGeneration(ctx context.Context, cfg *Config, cred *credential, req gener
 			recordTask(taskRecord{
 				ID: taskID, TaskID: taskID, Account: cred.displayLabel(), Model: req.Model,
 				Media: req.Media, Prompt: truncateRunes(req.Prompt, 400), Status: "cancelled",
-				StartedAt: started, FinishedAt: time.Now(),
+				StartedAt: formatTime(started), FinishedAt: formatTime(time.Now()),
 				ElapsedMS: time.Since(started).Milliseconds(),
 			})
 			return nil, ctx.Err()
@@ -251,7 +257,7 @@ func runGeneration(ctx context.Context, cfg *Config, cred *credential, req gener
 				upsertTask(taskRecord{
 					ID: taskID, TaskID: taskID, Account: cred.displayLabel(), Model: req.Model,
 					Media: req.Media, Prompt: truncateRunes(req.Prompt, 400), Status: state.Status,
-					Progress: state.Progress, StartedAt: started,
+					Progress: state.Progress, StartedAt: formatTime(started),
 				})
 				if onProgress != nil {
 					onProgress(state.Status, state.Progress, "")
@@ -263,7 +269,7 @@ func runGeneration(ctx context.Context, cfg *Config, cred *credential, req gener
 					recordTask(taskRecord{
 						ID: taskID, TaskID: taskID, Account: cred.displayLabel(), Model: req.Model,
 						Media: req.Media, Prompt: truncateRunes(req.Prompt, 400), Status: "failed",
-						Error: errTask.Error(), StartedAt: started, FinishedAt: time.Now(),
+						Error: errTask.Error(), StartedAt: formatTime(started), FinishedAt: formatTime(time.Now()),
 						ElapsedMS: time.Since(started).Milliseconds(),
 					})
 					recordEvent(eventRecord{
@@ -281,7 +287,7 @@ func runGeneration(ctx context.Context, cfg *Config, cred *credential, req gener
 			recordTask(taskRecord{
 				ID: taskID, TaskID: taskID, Account: cred.displayLabel(), Model: req.Model,
 				Media: req.Media, Prompt: truncateRunes(req.Prompt, 400), Status: "timeout",
-				Error: errTimeout.Error(), StartedAt: started, FinishedAt: time.Now(),
+				Error: errTimeout.Error(), StartedAt: formatTime(started), FinishedAt: formatTime(time.Now()),
 				ElapsedMS: time.Since(started).Milliseconds(),
 			})
 			return nil, errTimeout
@@ -336,7 +342,7 @@ func finalizeGeneration(ctx context.Context, cfg *Config, client *apiClient, cre
 		ID: state.TaskID, TaskID: state.TaskID, Account: cred.displayLabel(), Model: req.Model,
 		Media: req.Media, Prompt: truncateRunes(req.Prompt, 400), Status: "completed",
 		Progress: 100, Credit: result.Credit, Files: files,
-		StartedAt: started, FinishedAt: time.Now(), ElapsedMS: result.ElapsedMS,
+		StartedAt: formatTime(started), FinishedAt: formatTime(time.Now()), ElapsedMS: result.ElapsedMS,
 	})
 	recordEvent(eventRecord{
 		Time: time.Now(), Account: cred.displayLabel(), Model: req.Model, Media: req.Media,

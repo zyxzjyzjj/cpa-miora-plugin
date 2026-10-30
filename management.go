@@ -280,16 +280,19 @@ func hostAccounts() ([]pluginapi.HostAuthFileEntry, error) {
 // accountSnapshot caches an account's identity and balance, so opening the panel
 // does not fan out one upstream call per account per refresh.
 type accountSnapshot struct {
-	Email     string    `json:"email"`
-	UserID    string    `json:"user_id"`
-	Plan      string    `json:"plan"`
-	Nickname  string    `json:"nickname"`
-	Credits   float64   `json:"credits"`
-	Total     float64   `json:"total_credits"`
-	Used      float64   `json:"used_credits"`
-	ExpiresAt string    `json:"expires_at"`
-	CheckedAt time.Time `json:"checked_at"`
-	Error     string    `json:"error,omitempty"`
+	Email     string  `json:"email"`
+	UserID    string  `json:"user_id"`
+	Plan      string  `json:"plan"`
+	Nickname  string  `json:"nickname"`
+	Credits   float64 `json:"credits"`
+	Total     float64 `json:"total_credits"`
+	Used      float64 `json:"used_credits"`
+	ExpiresAt string  `json:"expires_at"`
+	// CreditExpires is when the granted credits lapse (billing service), which is
+	// independent of the token expiry above.
+	CreditExpires string    `json:"credit_expires_at"`
+	CheckedAt     time.Time `json:"checked_at"`
+	Error         string    `json:"error,omitempty"`
 }
 
 var accountCache = struct {
@@ -435,6 +438,11 @@ func reflectAccount(ctx context.Context, index string, cred *credential) account
 	snapshot.Email = profile.Email
 	snapshot.UserID = profile.UserID
 	snapshot.Plan = profile.Plan
+	if snapshot.Plan == "" {
+		if credits, errCredits := client.fetchBillingSubscription(ctx); errCredits == nil && credits != nil {
+			snapshot.Plan = credits.TierName
+		}
+	}
 	snapshot.Nickname = profile.Nickname
 	if expiry := cred.expiry(); !expiry.IsZero() {
 		snapshot.ExpiresAt = expiry.UTC().Format(time.RFC3339)
@@ -443,6 +451,10 @@ func reflectAccount(ctx context.Context, index string, cred *credential) account
 		snapshot.Total = credits.TotalAmount.value()
 		snapshot.Used = credits.UsedAmount.value()
 		snapshot.Credits = credits.remaining()
+		snapshot.CreditExpires = credits.ExpiresAt
+		if snapshot.Plan == "" {
+			snapshot.Plan = credits.TierName
+		}
 	}
 	storeAccount(index, snapshot)
 	return snapshot
@@ -762,7 +774,7 @@ func handlePanelGenerate(body []byte) pluginapi.ManagementResponse {
 			recordTask(taskRecord{
 				ID: taskIDFor(generation), TaskID: "", Account: cred.displayLabel(), Model: model,
 				Media: media, Prompt: truncateRunes(generation.Prompt, 400), Status: "failed",
-				Error: "生成并发已满", StartedAt: time.Now(), FinishedAt: time.Now(),
+				Error: "生成并发已满", StartedAt: formatTime(time.Now()), FinishedAt: formatTime(time.Now()),
 			})
 			return
 		}

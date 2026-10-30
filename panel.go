@@ -616,7 +616,7 @@ const panelTemplate = `<!doctype html>
   function fmtTime(value) {
     if (!value) { return "—"; }
     var d = new Date(value);
-    if (isNaN(d.getTime())) { return String(value); }
+    if (isNaN(d.getTime()) || d.getFullYear() < 2000) { return "—"; }
     return d.toLocaleString("zh-CN", { hour12: false });
   }
   function fmtNumber(value) {
@@ -626,8 +626,14 @@ const panelTemplate = `<!doctype html>
   }
   function ago(value) {
     if (!value) { return ""; }
-    var diff = (Date.now() - new Date(value).getTime()) / 1000;
+    var when = new Date(value);
+    if (isNaN(when.getTime())) { return ""; }
+    // Guard against zero-valued timestamps ("0001-01-01T00:00:00Z"): they used to
+    // render as "739918 天前" for tasks that had not finished yet.
+    if (when.getFullYear() < 2000) { return ""; }
+    var diff = (Date.now() - when.getTime()) / 1000;
     if (!isFinite(diff)) { return ""; }
+    if (diff < 0) { return "刚刚"; }
     if (diff < 60) { return Math.max(0, Math.round(diff)) + " 秒前"; }
     if (diff < 3600) { return Math.round(diff / 60) + " 分钟前"; }
     if (diff < 86400) { return Math.round(diff / 3600) + " 小时前"; }
@@ -849,6 +855,7 @@ const panelTemplate = `<!doctype html>
         '<div class="bar"><i style="width:' + pct + '%"></i></div>' +
         '<div class="split tiny dim"><span>剩余 ' + fmtNumber(remaining) + " / " + fmtNumber(total) + " credits</span>" +
         "<span>已用 " + fmtNumber(credits.used_credits) + "</span>" +
+        (credits.credit_expires_at ? "<span>额度 " + esc(credits.credit_expires_at) + " 到期</span>" : "") +
         (credits.checked_at ? '<span class="right">' + ago(credits.checked_at) + "更新</span>" : "") + "</div>" + err +
         '<div class="split"><button class="btn sm" data-acct-test="' + esc(acct.auth_index) + '">测试</button>' +
         '<button class="btn sm" data-acct-refresh="' + esc(acct.auth_index) + '">轮换 token</button>' +

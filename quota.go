@@ -47,7 +47,7 @@ func quotaFetch(request []byte) ([]byte, error) {
 		}
 		return failEnvelope("quota_unavailable", errCredits.Error(), http.StatusBadGateway)
 	}
-	plan := cred.Plan
+	plan := firstNonEmpty(credits.TierName, cred.Plan)
 	if plan == "" {
 		if profile, errProfile := client.fetchProfile(ctx); errProfile == nil {
 			plan = profile.Plan
@@ -81,7 +81,9 @@ func quotaFetch(request []byte) ([]byte, error) {
 			Buckets: []pluginapi.QuotaBucket{{
 				Window:            "account",
 				RemainingFraction: fraction,
-				Description:       fmt.Sprintf("剩余 %.2f / %.2f credits", remaining, total),
+				ResetTime:         credits.ExpiresAt,
+				Description: fmt.Sprintf("剩余 %.2f / %.2f credits%s",
+					remaining, total, expiryNote(credits.ExpiresAt)),
 			}},
 		}},
 	})
@@ -121,4 +123,12 @@ func firstNonZeroTime(value time.Time) time.Time {
 		return time.Now()
 	}
 	return value
+}
+
+// expiryNote renders the credit expiry window for the quota description.
+func expiryNote(expiresAt string) string {
+	if expiresAt == "" {
+		return ""
+	}
+	return "（" + expiresAt + " 到期）"
 }
