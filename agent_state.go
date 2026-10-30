@@ -23,6 +23,9 @@ type agentStateEntry struct {
 type agentStateFile struct {
 	Version int                        `json:"version"`
 	Entries map[string]agentStateEntry `json:"entries"`
+	// RetiredProjects are projects whose memory grew past the budget. They stay
+	// listed so the candidate walk never re-adopts them.
+	RetiredProjects []string `json:"retired_projects,omitempty"`
 }
 
 var agentState = struct {
@@ -31,6 +34,8 @@ var agentState = struct {
 	path   string
 	file   agentStateFile
 }{file: agentStateFile{Version: 1, Entries: map[string]agentStateEntry{}}}
+
+const retiredProjectLimit = 20
 
 func agentStatePath() string {
 	agentState.mu.Lock()
@@ -107,6 +112,53 @@ func forgetState(key string) {
 	agentState.mu.Unlock()
 	raw, errMarshal := json.MarshalIndent(snapshot, "", "  ")
 	if errMarshal == nil {
+		_ = os.WriteFile(path, raw, 0o644)
+	}
+}
+
+// retiredProjects returns the projects that must not be reused.
+func retiredProjects() map[string]struct{} {
+	loadAgentState()
+	agentState.mu.Lock()
+	defer agentState.mu.Unlock()
+	out := make(map[string]struct{}, len(agentState.file.RetiredProjects))
+	for _, id := range agentState.file.RetiredProjects {
+		out[id] = struct{}{}
+	}
+	return out
+}
+
+// retireProject forgets the account's current project and blacklists it so the next
+// turn provisions a fresh one (memory resets to the ~49k baseline).
+func retireProject(key string) {
+	loadAgentState()
+	agentState.mu.Lock()
+	entry, ok := agentState.file.Entries[key]
+	delete(agentState.file.Entries, key)
+	if ok && entry.ProjectID != "" {
+		already := false
+		for _, id := range agentState.file.RetiredProjects {
+			if id == entry.ProjectID {
+				already = true
+				break
+			}
+		}
+		if !already {
+			agentState.file.RetiredProjects = append(agentState.file.RetiredProjects, entry.ProjectID)
+		}
+		if len(agentState.file.RetiredProjects) > retiredProjectLimit {
+			agentState.file.RetiredProjects = agentState.file.RetiredProjects[len(agentState.file.RetiredProjects)-retiredProjectLimit:]
+		}
+	}
+	snapshot := agentState.file
+	path := agentState.path
+	agentState.mu.Unlock()
+
+	rememberedProjects.mu.Lock()
+	delete(rememberedProjects.byKey, key)
+	rememberedProjects.mu.Unlock()
+
+	if raw, errMarshal := json.MarshalIndent(snapshot, "", "  "); errMarshal == nil {
 		_ = os.WriteFile(path, raw, 0o644)
 	}
 }

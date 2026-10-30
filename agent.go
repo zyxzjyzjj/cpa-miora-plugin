@@ -321,7 +321,11 @@ func ensureAgentRuntime(ctx context.Context, cfg *Config, cred *credential) (*ag
 		candidates = append(candidates, projects...)
 	}
 
+	retired := retiredProjects()
 	for _, projectID := range candidates {
+		if _, skip := retired[projectID]; skip {
+			continue
+		}
 		runtime, errProject := runtimeForProject(ctx, client, cfg, projectID)
 		if errProject != nil {
 			continue

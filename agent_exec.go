@@ -75,7 +75,7 @@ func runAgentTurn(ctx context.Context, cfg *Config, plan *executionPlan, onDelta
 			"prompt_tokens": usage.InputTokens,
 			"budget":        budget,
 		})
-		forgetState(agentAccountKey(cfg, plan.cred))
+		retireProject(agentAccountKey(cfg, plan.cred))
 		forgetAgentRuntime(cfg, plan.cred)
 	}
 	// Design tools (image / video / 3D) return artifacts out of band; surface them
