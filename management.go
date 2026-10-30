@@ -535,6 +535,7 @@ func handleAccountImport(body []byte, source string) pluginapi.ManagementRespons
 		snapshot.Used = credits.UsedAmount.value()
 		snapshot.Credits = credits.remaining()
 	}
+	storeAccount(strings.TrimSpace(imported.UserID), snapshot)
 	return jsonResponse(http.StatusOK, map[string]any{
 		"ok":         true,
 		"name":       name,

@@ -712,7 +712,12 @@ const panelTemplate = `<!doctype html>
     if (window.location.hash.slice(1) !== view) {
       window.history.replaceState(null, "", "#" + view);
     }
-    if (view === "accounts") { loadAccounts(false); }
+    if (view === "accounts") {
+      loadAccounts(false).then(function (accounts) {
+        var missing = (accounts || []).some(function (acct) { return !acct.credits; });
+        if (missing) { loadAccounts(true); }
+      });
+    }
     if (view === "studio") { loadTasks(); }
     if (view === "library") { loadMedia(); }
     if (view === "models") { loadModels(); }
@@ -837,6 +842,7 @@ const panelTemplate = `<!doctype html>
     }
     container.innerHTML = state.accounts.map(function (acct) {
       var credits = acct.credits || {};
+      var hasBalance = !!acct.credits;
       var total = Number(credits.total_credits || credits.total || 0);
       var remaining = Number(credits.credits || 0);
       var pct = total > 0 ? Math.max(0, Math.min(100, (remaining / total) * 100)) : (remaining > 0 ? 100 : 0);
@@ -852,9 +858,12 @@ const panelTemplate = `<!doctype html>
         '<div class="split">' + expiryPill +
         (acct.has_refresh_token ? '<span class="pill ok">可自动续期</span>' : '<span class="pill warn">无 refresh token</span>') +
         "</div></div>" +
-        '<div class="bar"><i style="width:' + pct + '%"></i></div>' +
-        '<div class="split tiny dim"><span>剩余 ' + fmtNumber(remaining) + " / " + fmtNumber(total) + " credits</span>" +
-        "<span>已用 " + fmtNumber(credits.used_credits) + "</span>" +
+        (hasBalance ? '<div class="bar"><i style="width:' + pct + '%"></i></div>' : "") +
+        '<div class="split tiny dim"><span>' +
+        (hasBalance
+          ? "剩余 " + fmtNumber(remaining) + " / " + fmtNumber(total) + " credits"
+          : "额度未拉取（点右上角「拉取实时额度」）") + "</span>" +
+        (hasBalance ? "<span>已用 " + fmtNumber(credits.used_credits) + "</span>" : "") +
         (credits.credit_expires_at ? "<span>额度 " + esc(credits.credit_expires_at) + " 到期</span>" : "") +
         (credits.checked_at ? '<span class="right">' + ago(credits.checked_at) + "更新</span>" : "") + "</div>" + err +
         '<div class="split"><button class="btn sm" data-acct-test="' + esc(acct.auth_index) + '">测试</button>' +
