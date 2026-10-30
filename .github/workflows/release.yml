@@ -124,5 +124,8 @@ jobs:
             if [ -f "docs/releases/$RELEASE_TAG.md" ]; then
               notes=(--notes-file "docs/releases/$RELEASE_TAG.md")
             fi
-            gh release create "$RELEASE_TAG" "${assets[@]}" --verify-tag --title "$RELEASE_TAG" "${notes[@]}"
+            # --draft=false is explicit: the default has produced draft releases here,
+            # and a draft release has no public asset URLs for the plugin store.
+            gh release create "$RELEASE_TAG" "${assets[@]}" --verify-tag --draft=false --latest \
+              --title "$RELEASE_TAG" "${notes[@]}"
           fi
